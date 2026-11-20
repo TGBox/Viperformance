@@ -1,0 +1,9 @@
+[project]
+name = "viperformance"
+version = "0.1.0"
+description = "A python application to identify, analyze and evaluate the cause of performance bottlenecks on your PC."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "psutil>=5.9",
+]
