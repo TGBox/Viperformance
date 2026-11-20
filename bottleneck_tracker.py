@@ -49,7 +49,7 @@ MARKER_AFTER_S = 3
 FIELDS = [
     "ts", "cpu", "core_max", "perf_pct", "mhz", "ram", "commit", "hard_faults",
     "disk_busy", "disk_lat_ms", "disk_queue", "temp_c", "passive_limit",
-    "on_battery", "marker", "top",
+    "on_battery", "marker", "top", "pages_out", "pagefile_pct", "disk_name", "disk_lat_name",
 ]
 
 
@@ -86,10 +86,14 @@ class PerfCounters:
         "disk_queue": r"\PhysicalDisk(_Total)\Avg. Disk Queue Length",
         "hard_faults": r"\Memory\Pages Input/sec",
         "commit": r"\Memory\% Committed Bytes In Use",
+        "pages_out": r"\Memory\Pages Output/sec",
+        "pagefile_pct": r"\Paging File(_Total)\% Usage",
     }
     MULTI = {
         "temp_k": r"\Thermal Zone Information(*)\Temperature",
         "passive_limit": r"\Thermal Zone Information(*)\% Passive Limit",
+        "disk_idle_each": r"\PhysicalDisk(*)\% Idle Time",
+        "disk_lat_each": r"\PhysicalDisk(*)\Avg. Disk sec/Transfer",
     }
 
     def __init__(self):
@@ -133,7 +137,7 @@ class PerfCounters:
         return self.query is not None
 
     def read(self) -> dict:
-        """Liefert {name: float|None} fuer Einzelzaehler und {name: [floats]} fuer Mehrfachzaehler."""
+        """Liefert {name: float|None} fuer Einzelzaehler und {name: [(instanz, float)]} fuer Mehrfachzaehler."""
         out = {k: None for k in self.SINGLE}
         out.update({k: [] for k in self.MULTI})
         if not self.available:
@@ -162,7 +166,7 @@ class PerfCounters:
         if rc != 0:
             return []
         items = ctypes.cast(buf, ctypes.POINTER(_PdhItem))
-        return [items[i].FmtValue.doubleValue for i in range(count.value)
+        return [(items[i].szName or "", items[i].FmtValue.doubleValue) for i in range(count.value)
                 if items[i].FmtValue.CStatus in (0, 1)]
 
     def close(self):
@@ -212,7 +216,6 @@ class Recorder:
         self.thread = threading.Thread(target=self._run, name="sampler", daemon=True)
 
     def start(self):
-        psutil.cpu_percent(percpu=True)      # Zaehler anstossen, erster Wert waere sonst 0
         self._sweep_processes()              # dito fuer die Prozess-Zaehler
         self.thread.start()
 
@@ -226,6 +229,7 @@ class Recorder:
             self._marker = label or "Marker"
 
     def _run(self):
+        psutil.cpu_percent(percpu=True)      # Zaehler anstossen (psutil merkt sich den Stand je Thread)
         next_tick = time.monotonic() + self.interval
         next_sweep = time.monotonic() + PROCESS_SWEEP_SECONDS
         with open(self.csv_path, "w", newline="", encoding="utf-8") as fh:
@@ -252,7 +256,14 @@ class Recorder:
         cores = psutil.cpu_percent(percpu=True)
         pc = self.perf.read()
         perf_pct = pc["perf_pct"]
-        temps = [k - 273.15 for k in pc["temp_k"] if k and k > 200]
+        temps = [k - 273.15 for _, k in pc["temp_k"] if k and k > 200]
+        # Je Laufwerk messen: "_Total" mittelt ueber alle Laufwerke und versteckt ein einzelnes volles.
+        busy_each = [(min(100.0, max(0.0, 100.0 - v)), n) for n, v in pc["disk_idle_each"] if n != "_Total"]
+        lat_each = [(v * 1000, n) for n, v in pc["disk_lat_each"] if n != "_Total"]
+        disk_busy, disk_name = max(busy_each) if busy_each else (
+            min(100.0, max(0.0, 100.0 - pc["disk_idle"])) if pc["disk_idle"] is not None else None, "")
+        disk_lat, disk_lat_name = max(lat_each) if lat_each else (
+            pc["disk_lat"] * 1000 if pc["disk_lat"] is not None else None, "")
         try:
             battery = psutil.sensors_battery()
         except Exception:
@@ -266,20 +277,24 @@ class Recorder:
             "ram": _r(psutil.virtual_memory().percent),
             "commit": _r(pc["commit"]),
             "hard_faults": _r(pc["hard_faults"], 0),
-            "disk_busy": _r(min(100.0, max(0.0, 100.0 - pc["disk_idle"]))) if pc["disk_idle"] is not None else "",
-            "disk_lat_ms": _r(pc["disk_lat"] * 1000, 2) if pc["disk_lat"] is not None else "",
+            "disk_busy": _r(disk_busy),
+            "disk_lat_ms": _r(disk_lat, 2),
             "disk_queue": _r(pc["disk_queue"], 2),
             "temp_c": _r(max(temps)) if temps else "",
-            "passive_limit": _r(min(pc["passive_limit"])) if pc["passive_limit"] else "",
+            "passive_limit": _r(min(v for _, v in pc["passive_limit"])) if pc["passive_limit"] else "",
             "on_battery": "" if battery is None or battery.power_plugged is None
                           else (0 if battery.power_plugged else 1),
             "marker": "",
             "top": "",
+            "pages_out": _r(pc["pages_out"], 0),
+            "pagefile_pct": _r(pc["pagefile_pct"]),
+            "disk_name": disk_name,
+            "disk_lat_name": disk_lat_name,
         }
         return row
 
     def _sweep_processes(self) -> list:
-        """Top-Prozesse seit dem letzten Durchlauf: [[name, cpu_anteil_%, io_bytes], ...]"""
+        """Top-Prozesse seit dem letzten Durchlauf: [[name, cpu_anteil_%, io_bytes, ram_mb], ...]"""
         ncpu = psutil.cpu_count() or 1
         agg, io_now = {}, {}
         for proc in psutil.process_iter(["name"]):
@@ -288,6 +303,7 @@ class Recorder:
             try:
                 with proc.oneshot():
                     cpu = proc.cpu_percent(None) / ncpu
+                    rss = proc.memory_info().rss
                     try:
                         io = proc.io_counters()
                         io_total = io.read_bytes + io.write_bytes
@@ -302,15 +318,18 @@ class Recorder:
                     delta = io_total - prev
                 io_now[proc.pid] = io_total
             name = proc.info.get("name") or f"pid {proc.pid}"
-            entry = agg.setdefault(name, [0.0, 0])
+            entry = agg.setdefault(name, [0.0, 0, 0])
             entry[0] += cpu
             entry[1] += delta
+            entry[2] += rss
         self._io_prev = io_now
         by_cpu = sorted(agg.items(), key=lambda kv: kv[1][0], reverse=True)[:5]
         by_io = sorted(agg.items(), key=lambda kv: kv[1][1], reverse=True)[:3]
         picked = {n: v for n, v in by_cpu if v[0] >= 0.5}
         picked.update({n: v for n, v in by_io if v[1] >= 1_000_000})
-        return [[n, round(v[0], 1), int(v[1])] for n, v in picked.items()]
+        by_ram = sorted(agg.items(), key=lambda kv: kv[1][2], reverse=True)[:5]
+        picked.update(dict(by_ram))
+        return [[n, round(v[0], 1), int(v[1]), round(v[2] / 1e6)] for n, v in picked.items()]
 
 
 def _r(value, digits=1):
@@ -375,7 +394,9 @@ def load_csv(csv_path: Path) -> tuple:
                 ts = datetime.fromisoformat(raw["ts"])
             except (KeyError, ValueError, TypeError):
                 continue                       # abgeschnittene letzte Zeile o. ae.
-            row = {k: _num(raw.get(k)) for k in FIELDS if k not in ("ts", "marker", "top")}
+            row = {k: _num(raw.get(k)) for k in FIELDS if k not in ("ts", "marker", "top", "disk_name", "disk_lat_name")}
+            row["disk_name"] = raw.get("disk_name") or ""
+            row["disk_lat_name"] = raw.get("disk_lat_name") or ""
             row["ts"] = ts
             row["marker"] = raw.get("marker") or ""
             try:
@@ -432,7 +453,7 @@ def top_label(sweeps):
     """Auffaelligster Prozess (CPU bzw. I/O) aus einer Liste von Prozess-Durchlaeufen."""
     best_cpu, best_io = None, None
     for sweep in sweeps:
-        for name, cpu, io in sweep:
+        for name, cpu, io, *_ in sweep:
             if best_cpu is None or cpu > best_cpu[1]:
                 best_cpu = (name, cpu)
             if best_io is None or io > best_io[1]:
@@ -479,29 +500,62 @@ def diagnose(rows, meta) -> list:
                     "hier nicht, nur hoeherer Takt."))
 
     # --- RAM ----------------------------------------------------------------------
+    # "Pages Input/sec" zaehlt auch ganz normales Einlesen von Programm- und Datendateien.
+    # Echtes Auslagern zeigt sich an "Pages Output/sec" (Schreiben in die Auslagerungsdatei).
     ram_p90 = quantile(col(rows, "ram"), 0.90)
     faults_p95 = quantile(col(rows, "hard_faults"), 0.95)
+    out_p95 = quantile(col(rows, "pages_out"), 0.95)
+    paging, _ = share(rows, lambda r: r["pages_out"] >= 100)
     if ram_p90 is not None and ram_p90 > 88:
-        swap = (f" Gleichzeitig wurden bis zu {fmt(faults_p95)} Seiten/s von der Auslagerungsdatei "
-                "nachgeladen (P95) - Windows lagert also tatsaechlich aus."
-                if faults_p95 is not None and faults_p95 > 500 else "")
-        out.append(("bad" if swap else "warn", "Arbeitsspeicher knapp",
-                    f"In den Spitzen (P90) waren {fmt(ram_p90, ' %')} des RAM belegt.{swap}"))
-    elif faults_p95 is not None and faults_p95 > 2000:
-        out.append(("warn", "Haeufiges Nachladen von der Platte",
-                    f"Bis zu {fmt(faults_p95)} Seiten/s wurden nachgeladen (P95), obwohl der RAM nicht voll war - "
-                    "meist Programmstarts oder grosse Dateien."))
+        procs = top_processes(rows)
+        hogs = sorted((p for p in procs if p["ram_mb"]), key=lambda p: p["ram_mb"], reverse=True)[:3]
+        who = (" Groesste Verbraucher: " + ", ".join(f"{p['name']} ({fmt(p['ram_mb'] / 1000, ' GB', 1)})"
+                                                      for p in hogs) + ".") if hogs else ""
+        if paging is not None and paging >= 5:
+            level, extra = "bad", (f" In {fmt(paging, ' %')} der Zeit hat Windows Speicher in die "
+                                   f"Auslagerungsdatei geschrieben (P95: {fmt(out_p95)} Seiten/s) - es lagert "
+                                   "also tatsaechlich aus, und das bremst.")
+        elif paging is not None:
+            level, extra = "warn", (" Windows hat dabei aber kaum in die Auslagerungsdatei geschrieben - "
+                                    "der Speicher ist knapp, hat in dieser Messung aber noch nicht gebremst.")
+        elif faults_p95 is not None and faults_p95 > 500:
+            level, extra = "warn", (f" Gleichzeitig wurden bis zu {fmt(faults_p95)} Seiten/s von der Platte "
+                                    "nachgeladen (P95). Das kann Auslagern sein, aber auch normales Einlesen von "
+                                    "Dateien - diese aeltere Messung unterscheidet das nicht.")
+        else:
+            level, extra = "warn", ""
+        out.append((level, "Arbeitsspeicher knapp",
+                    f"In den Spitzen (P90) waren {fmt(ram_p90, ' %')} des RAM belegt.{extra}{who}"))
+    elif paging is not None and paging >= 5:
+        out.append(("warn", "Windows lagert aus",
+                    f"In {fmt(paging, ' %')} der Zeit wurde in die Auslagerungsdatei geschrieben, obwohl der RAM "
+                    "nicht dauerhaft voll war."))
 
-    # --- Datentraeger ---------------------------------------------------------------
+    # --- Datentraeger (jeweils das am staerksten betroffene Laufwerk) ----------------
+    def worst_drive(key, predicate):
+        names = [r.get(key) for r in rows if r.get(key) and _safe(predicate, r)]
+        if not names:
+            return ""
+        return f" Betroffen vor allem: Laufwerk {max(set(names), key=names.count)}."
+
     busy, _ = share(rows, lambda r: r["disk_busy"] >= 90)
     lat_p95 = quantile(col(rows, "disk_lat_ms"), 0.95)
+    lat_max = quantile(col(rows, "disk_lat_ms"), 1.0)
+    stalls, _ = share(rows, lambda r: r["disk_lat_ms"] >= 100)
     if busy is not None and busy >= 5:
-        out.append(("warn", "Datentraeger dauerhaft beschaeftigt",
-                    f"In {fmt(busy, ' %')} der Zeit war der Datentraeger zu 90 % oder mehr aktiv."))
+        out.append(("warn", "Ein Laufwerk dauerhaft beschaeftigt",
+                    f"In {fmt(busy, ' %')} der Zeit war ein Laufwerk zu 90 % oder mehr aktiv."
+                    + worst_drive("disk_name", lambda r: r["disk_busy"] >= 90)))
     if lat_p95 is not None and lat_p95 > 25:
         out.append(("bad" if lat_p95 > 100 else "warn", "Datentraeger antwortet langsam",
                     f"Die Antwortzeit lag in den Spitzen (P95) bei {fmt(lat_p95, ' ms', 1)}. "
-                    "Eine gesunde SSD bleibt meist unter 5 ms."))
+                    "Eine gesunde SSD bleibt meist unter 5 ms."
+                    + worst_drive("disk_lat_name", lambda r: r["disk_lat_ms"] > 25)))
+    elif stalls is not None and stalls >= 1:
+        out.append(("warn", "Datentraeger haengt zeitweise",
+                    f"In {fmt(stalls, ' %', 1)} der Zeit brauchte ein Zugriff 100 ms oder laenger "
+                    f"(Maximum {fmt(lat_max, ' ms')}). Solche Aussetzer spuert man als kurzes Einfrieren."
+                    + worst_drive("disk_lat_name", lambda r: r["disk_lat_ms"] >= 100)))
 
     if not out:
         out.append(("ok", "Keine Hardware-Engstelle gefunden",
@@ -522,7 +576,7 @@ def analyze_markers(rows) -> list:
         low = lambda key: quantile(col(window, key), 0.0)
         flags = []
         cpu, core, perf = peak("cpu"), peak("core_max"), low("perf_pct")
-        ram, busy, lat, faults = peak("ram"), peak("disk_busy"), peak("disk_lat_ms"), peak("hard_faults")
+        ram, busy, lat, faults = peak("ram"), peak("disk_busy"), peak("disk_lat_ms"), peak("pages_out")
         limit = low("passive_limit")
         if cpu is not None and cpu >= 90:
             flags.append(f"CPU-Gesamtlast bis {fmt(cpu, ' %')}")
@@ -534,10 +588,12 @@ def analyze_markers(rows) -> list:
             flags.append(f"thermisches Limit {fmt(limit, ' %')}")
         if ram is not None and ram > 90:
             flags.append(f"RAM bei {fmt(ram, ' %')}")
-        if faults is not None and faults > 1000:
-            flags.append(f"{fmt(faults)} Seiten/s von der Platte nachgeladen")
+        if faults is not None and faults >= 100:
+            flags.append(f"{fmt(faults)} Seiten/s in die Auslagerungsdatei geschrieben")
         if lat is not None and lat > 25:
-            flags.append(f"Datentraeger-Antwortzeit bis {fmt(lat, ' ms', 1)}")
+            slow = max((r for r in window if r["disk_lat_ms"] is not None), key=lambda r: r["disk_lat_ms"])
+            flags.append(f"Datentraeger-Antwortzeit bis {fmt(lat, ' ms', 1)}"
+                         + (f" (Laufwerk {slow['disk_lat_name']})" if slow.get("disk_lat_name") else ""))
         elif busy is not None and busy >= 90:
             flags.append(f"Datentraeger zu {fmt(busy, ' %')} aktiv")
         best_cpu, best_io = top_label([r["top"] for r in window if r["top"]])
@@ -554,16 +610,18 @@ def top_processes(rows) -> list:
     sweeps = [r["top"] for r in rows if r["top"] is not None]
     agg = {}
     for sweep in sweeps:
-        for name, cpu, io in sweep:
-            entry = agg.setdefault(name, {"sum": 0.0, "peak": 0.0, "io": 0, "seen": 0})
+        for name, cpu, io, *rest in sweep:
+            entry = agg.setdefault(name, {"sum": 0.0, "peak": 0.0, "io": 0, "ram": None})
             entry["sum"] += cpu
             entry["peak"] = max(entry["peak"], cpu)
             entry["io"] += io
-            entry["seen"] += 1
+            if rest:
+                entry["ram"] = max(entry["ram"] or 0, rest[0])
     table = [{"name": n, "avg": e["sum"] / len(sweeps), "peak": e["peak"], "io_mb": e["io"] / 1e6,
-              "seen": 100.0 * e["seen"] / len(sweeps)} for n, e in agg.items()]
-    table.sort(key=lambda e: (e["avg"], e["io_mb"]), reverse=True)
-    return table[:12]
+              "ram_mb": e["ram"]} for n, e in agg.items()]
+    by_cpu = sorted(table, key=lambda e: (e["avg"], e["io_mb"]), reverse=True)[:10]
+    by_ram = sorted(table, key=lambda e: e["ram_mb"] or 0, reverse=True)[:5]
+    return by_cpu + [e for e in by_ram if e not in by_cpu and e["ram_mb"]]
 
 
 def downsample(rows, keys_max, keys_min, limit=1200):
@@ -591,11 +649,14 @@ CHARTS = [
      "series": [["perf_pct", "Takt", "a"]]},
     {"title": "Arbeitsspeicher", "unit": "%", "max": 100, "series": [
         ["ram", "physisch belegt", "a"], ["commit", "zugesichert (inkl. Auslagerungsdatei)", "b"]]},
-    {"title": "Datentraeger-Aktivitaet", "unit": "%", "max": 100, "series": [["disk_busy", "aktive Zeit", "a"]]},
-    {"title": "Datentraeger-Antwortzeit", "unit": "ms", "series": [["disk_lat_ms", "Antwortzeit je Zugriff", "a"]]},
-    {"title": "Nachgeladene Speicherseiten", "unit": "/s",
-     "note": "Dauerhaft hohe Werte bei vollem RAM bedeuten: Windows lagert aus.",
-     "series": [["hard_faults", "Seiten pro Sekunde", "a"]]},
+    {"title": "Datentraeger-Aktivitaet", "unit": "%", "max": 100, "note": "Je Messpunkt das am staerksten beschaeftigte Laufwerk.",
+     "series": [["disk_busy", "aktive Zeit", "a"]]},
+    {"title": "Datentraeger-Antwortzeit", "unit": "ms", "note": "Je Messpunkt das langsamste Laufwerk.",
+     "series": [["disk_lat_ms", "Antwortzeit je Zugriff", "a"]]},
+    {"title": "Speicherseiten von/zur Platte", "unit": "/s",
+     "note": "Gelesen: auch normales Laden von Programmen und Dateien. Geschrieben: Windows lagert aus - "
+             "dauerhaft ueber 0 heisst, der RAM reicht nicht.",
+     "series": [["hard_faults", "gelesen", "a"], ["pages_out", "in Auslagerungsdatei geschrieben", "b"]]},
     {"title": "Temperatur (ACPI-Thermalzone)", "unit": "°C",
      "note": "Grober Wert des Mainboards, nicht die Kerntemperatur der CPU.",
      "series": [["temp_c", "waermste Zone", "b"]]},
@@ -757,12 +818,15 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
 
     # --- Kacheln ---
     perf_loaded = [r["perf_pct"] for r in rows if r["cpu"] is not None and r["cpu"] >= 50]
+    takt_label = "Takt unter Last (Median)"
+    if not perf_loaded:
+        perf_loaded, takt_label = col(rows, "perf_pct"), "Takt (Median, keine Lastphase)"
     perf_med = quantile(perf_loaded, 0.5)
     takt = fmt(perf_med, " %") + (f" ({fmt(nominal * perf_med / 100)} MHz)" if perf_med and nominal else "")
     tiles = [
         (fmt(quantile(col(rows, "cpu"), 0.95), " %"), "CPU-Last (P95)"),
         (fmt(quantile(col(rows, "core_max"), 0.95), " %"), "staerkster Kern (P95)"),
-        (takt if perf_med is not None else "n/v", "Takt unter Last (Median)"),
+        (takt if perf_med is not None else "n/v", takt_label),
         (fmt(quantile(col(rows, "ram"), 1.0), " %"), "RAM (Maximum)"),
         (fmt(quantile(col(rows, "disk_lat_ms"), 0.95), " ms", 1), "Datentraeger-Antwortzeit (P95)"),
     ]
@@ -797,17 +861,17 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
         body = "".join(
             f"<tr><td>{esc(p['name'])}</td><td class='n'>{fmt(p['avg'], ' %', 1)}</td>"
             f"<td class='n'>{fmt(p['peak'], ' %')}</td><td class='n'>{fmt(p['io_mb'], ' MB')}</td>"
-            f"<td class='n'>{fmt(p['seen'], ' %')}</td></tr>" for p in procs)
+            f"<td class='n'>{fmt(p['ram_mb'] / 1000, ' GB', 1) if p['ram_mb'] else 'n/v'}</td></tr>" for p in procs)
         processes_html = ('<div class="card"><h2>Aktivste Prozesse</h2><table><tr><th>Prozess</th>'
                           "<th class='n'>CPU im Schnitt</th><th class='n'>CPU-Spitze</th>"
-                          "<th class='n'>Datentraeger-I/O gesamt</th><th class='n'>auffaellig in</th></tr>"
+                          "<th class='n'>Datentraeger-I/O gesamt</th><th class='n'>RAM (Spitze)</th></tr>"
                           f"{body}</table><p class='note'>CPU-Werte als Anteil an der gesamten Rechenleistung "
                           f"(alle Kerne = 100 %), erfasst alle {PROCESS_SWEEP_SECONDS:g} s. Gleichnamige Prozesse "
-                          "sind zusammengefasst. \"Auffaellig in\": Anteil der Durchlaeufe, in denen der Prozess "
-                          "unter den Top 5 war.</p></div>")
+                          "sind zusammengefasst.</p></div>")
 
     # --- Diagrammdaten ---
-    keys_max = ["cpu", "core_max", "ram", "commit", "disk_busy", "disk_lat_ms", "hard_faults", "temp_c"]
+    keys_max = ["cpu", "core_max", "ram", "commit", "disk_busy", "disk_lat_ms", "hard_faults", "pages_out",
+                "temp_c"]
     keys_min = ["perf_pct"]
     times, series = downsample(rows, keys_max, keys_min)
     charts = []
@@ -824,6 +888,9 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
     }
 
     notes = [f"Messintervall {esc(meta.get('interval', '?'))} s, {len(rows)} Messpunkte."]
+    if minutes < 2:
+        notes.insert(0, "Sehr kurze Messung - die Diagnose ist nur eine Momentaufnahme. Aussagekraeftig wird es "
+                        "ab einigen Minuten normaler Arbeit, am besten mit Markern.")
     if len(rows) > len(times):
         notes.append("Fuer die Diagramme wurden die Daten verdichtet; dabei bleibt je Abschnitt die Spitze "
                      "(beim Takt der tiefste Wert) erhalten.")
