@@ -1,11 +1,17 @@
 # Viperformance – Bottleneck-Tracker
 
 Zeichnet auf, was den Laptop ausbremst, und erzeugt daraus einen HTML-Bericht.
-Reines Python: kein HWiNFO64, keine Admin-Rechte, kein Internet nötig.
+Reines Python: kein HWiNFO64, kein Internet nötig. Admin-Rechte nur für die CPU-Temperatur.
 
 ## Einrichtung (einmalig)
 
     uv sync
+    winget install PawnIO      (Treiber für die CPU-Temperatur)
+
+Die Temperaturen liest [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
+über das Paket `HardwareMonitor`. Dafür muss das Skript als Administrator laufen; `start.bat`
+fragt per UAC danach. Ohne Admin-Rechte oder ohne PawnIO läuft die Messung trotzdem, nur ohne
+Temperaturen.
 
 ## Benutzung
 
@@ -35,15 +41,21 @@ Optionen: `--interval 0.5` (Messintervall in s), `--out ORDNER`,
 | Datenträger-Aktivität/-Latenz | `% Idle Time`, `Avg. Disk sec/Transfer` je Laufwerk |
 | Thermische Drosselung         | `Thermal Zone Information` (falls vorhanden)        |
 | Akku-/Netzbetrieb             | psutil                                              |
+| Grafikeinheit: Auslastung     | `GPU Engine\Utilization Percentage` (wie Task-Manager) |
+| Grafikspeicher                | `GPU Adapter Memory` (eigener + geteilter)          |
+| CPU-/GPU-Temperatur           | LibreHardwareMonitor (Admin + PawnIO)               |
 | Top-Prozesse (CPU, I/O, RAM) | psutil, mind. alle 10 s (eigener Thread)           |
 
-Nicht erfasst: Grafikkarte, Netzwerk, echte CPU-Kerntemperatur.
+Nicht erfasst: Netzwerk, GPU-Last je Programm. Eine Onboard-Grafik hat meist keinen eigenen
+Temperatursensor; maßgeblich ist dann die CPU-Temperatur.
 
 ## Diagnose-Regeln
 
 - **Drosselung:** CPU-Last ≥ 50 % und Takt < 75 % des Nenntakts in ≥ 10 % der Lastzeit
 - **Angezogene Bremse:** Last ≥ 30 % oder ein Kern ≥ 90 %, und Takt < 75 % in ≥ 25 % dieser Zeit
 - **Thermisches Limit:** ACPI-Passivlimit < 100 % in ≥ 1 % der Zeit
+- **Prozessor sehr heiß:** CPU-Temperatur ≥ 95 °C in ≥ 5 % der Zeit
+- **Grafikeinheit ausgelastet:** ≥ 90 % in ≥ 5 % der Zeit
 - **CPU ausgelastet:** Gesamtlast ≥ 90 % in ≥ 5 % der Zeit
 - **Ein Kern am Anschlag:** ein Kern ≥ 95 % bei Gesamtlast < 50 % in ≥ 5 % der Zeit
 - **RAM knapp:** P90 > 88 %; als Auslagern gilt nur, wenn in ≥ 5 % der Zeit ≥ 100 Seiten/s in die Auslagerungsdatei geschrieben werden

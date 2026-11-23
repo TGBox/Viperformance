@@ -2,8 +2,10 @@
 """
 Bottleneck-Tracker: zeichnet auf, was den Laptop ausbremst, und erzeugt einen HTML-Bericht.
 
-Kommt ohne HWiNFO64, ohne Admin-Rechte und ohne Internet aus.
-Einzige Abhängigkeit:  psutil (einmalig: uv sync  oder  pip install psutil)
+Kommt ohne HWiNFO64 und ohne Internet aus.
+Abhängigkeiten (einmalig: uv sync):  psutil, dazu HardwareMonitor (LibreHardwareMonitor)
+für CPU-/GPU-Temperaturen. Die Temperaturen brauchen Admin-Rechte und den PawnIO-Treiber
+(winget install PawnIO); ohne beides läuft alles andere trotzdem.
 
 Start:       uv run bottleneck_tracker.py  (oder Doppelklick auf start.bat)
 Während der Aufzeichnung:
@@ -17,8 +19,8 @@ Weitere Optionen:
     --no-open          Bericht nicht automatisch im Browser öffnen
 
 Datenquellen: psutil (CPU-Last je Kern, RAM, Prozesse, Akku) und die Windows-
-Leistungsindikatoren (PDH) für CPU-Takt, Datenträger-Latenz, Auslagerung und
-ACPI-Thermalzonen. Die Indikatoren werden über ihre englischen Namen angesprochen
+Leistungsindikatoren (PDH) für CPU-Takt, Datenträger-Latenz, Auslagerung,
+ACPI-Thermalzonen sowie Auslastung und Speicher der Grafikeinheit. Die Indikatoren werden über ihre englischen Namen angesprochen
 und funktionieren deshalb auch auf einem deutschen Windows.
 """
 from __future__ import annotations
@@ -51,7 +53,7 @@ FIELDS = [
     "ts", "cpu", "core_max", "perf_pct", "mhz", "ram", "commit", "hard_faults",
     "disk_busy", "disk_lat_ms", "disk_queue", "temp_c", "passive_limit",
     "on_battery", "marker", "top", "pages_out", "pagefile_pct", "disk_name", "disk_lat_name",
-    "self_cpu", "sweep_s",
+    "self_cpu", "sweep_s", "gpu", "gpu_mem_mb", "cpu_temp", "gpu_temp",
 ]
 
 
@@ -96,6 +98,9 @@ class PerfCounters:
         "passive_limit": r"\Thermal Zone Information(*)\% Passive Limit",
         "disk_idle_each": r"\PhysicalDisk(*)\% Idle Time",
         "disk_lat_each": r"\PhysicalDisk(*)\Avg. Disk sec/Transfer",
+        "gpu_engine": r"\GPU Engine(*)\Utilization Percentage",
+        "gpu_mem_dedicated": r"\GPU Adapter Memory(*)\Dedicated Usage",
+        "gpu_mem_shared": r"\GPU Adapter Memory(*)\Shared Usage",
     }
 
     def __init__(self):
@@ -180,6 +185,103 @@ class PerfCounters:
             self.query = None
 
 
+def gpu_load(engines) -> float | None:
+    """Wie im Task-Manager: je GPU-Engine die Anteile aller Prozesse addieren, die vollste Engine zählt.
+
+    Instanzname: pid_1234_luid_0x..._phys_0_eng_0_engtype_3D
+    """
+    total = {}
+    for name, value in engines:
+        key = name.partition("_luid_")[2] or name
+        total[key] = total.get(key, 0.0) + value
+    return min(100.0, max(total.values())) if total else None
+
+
+def gpu_memory_mb(dedicated, shared) -> float | None:
+    """Belegter Grafikspeicher des Adapters mit dem höchsten Verbrauch (eigener + mit dem RAM geteilter)."""
+    total = {}
+    for name, value in list(dedicated) + list(shared):
+        total[name] = total.get(name, 0.0) + value
+    return max(total.values()) / 1e6 if total else None
+
+
+class Sensors:
+    """CPU-/GPU-Temperaturen über LibreHardwareMonitor (PyPI-Paket HardwareMonitor).
+
+    Zusatz: Fehlt das Paket, fehlen Admin-Rechte oder der PawnIO-Treiber, bleiben die Werte leer
+    und `reason` nennt den Grund. Die Messung selbst läuft immer weiter.
+    """
+
+    def __init__(self):
+        self.computer = None
+        self.reason = None
+        self.gpu_name = None
+        if not IS_WINDOWS:
+            self.reason = "nur unter Windows verfügbar"
+            return
+        try:
+            from HardwareMonitor.Hardware import Computer
+        except Exception as exc:
+            self.reason = f"Paket HardwareMonitor nicht ladbar ({exc}) - einmalig  uv sync  ausführen"
+            return
+        try:
+            computer = Computer()
+            computer.IsCpuEnabled = True
+            computer.IsGpuEnabled = True
+            computer.Open()
+            self.computer = computer
+            for hw in computer.Hardware:
+                if self._kind(hw.HardwareType).startswith("Gpu"):
+                    self.gpu_name = str(hw.Name)
+                    break
+            if self.read()["cpu_temp"] is None:
+                self.reason = ("CPU-Temperatur nicht lesbar - PawnIO-Treiber installieren (winget install PawnIO)"
+                               if is_admin() else "CPU-Temperatur nicht lesbar - als Administrator starten")
+        except Exception as exc:
+            self.reason = f"LibreHardwareMonitor nicht startbar ({exc})"
+            self.computer = None
+
+    @staticmethod
+    def _kind(enum_value) -> str:
+        return str(enum_value).rsplit(".", 1)[-1]      # .NET-Enum -> "Cpu", "GpuIntel", "Temperature", ...
+
+    def read(self) -> dict:
+        out = {"cpu_temp": None, "gpu_temp": None}
+        if self.computer is None:
+            return out
+        try:
+            for hw in self.computer.Hardware:
+                kind = self._kind(hw.HardwareType)
+                key = "cpu_temp" if kind == "Cpu" else "gpu_temp" if kind.startswith("Gpu") else None
+                if key is None:
+                    continue
+                hw.Update()
+                temps = [float(s.Value) for s in hw.Sensors
+                         if self._kind(s.SensorType) == "Temperature" and s.Value is not None
+                         and "Distance" not in str(s.Name)]          # "Distance to TjMax" ist ein Abstand
+                temps = [t for t in temps if 0 < t < 150]
+                if temps:
+                    out[key] = max(temps + ([out[key]] if out[key] is not None else []))
+        except Exception:
+            pass
+        return out
+
+    def close(self):
+        if self.computer is not None:
+            try:
+                self.computer.Close()
+            except Exception:
+                pass
+            self.computer = None
+
+
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def cpu_identity() -> tuple:
     """(Name, Nenntakt in MHz) - aus der Registry, lesbar ohne Admin-Rechte."""
     name, mhz = None, None
@@ -210,6 +312,7 @@ class Recorder:
         self.interval = interval
         self.stop_event = threading.Event()
         self.perf = PerfCounters()
+        self.sensors = Sensors()
         self.cpu_name, self.nominal_mhz = cpu_identity()
         self._marker = None
         self._marker_lock = threading.Lock()
@@ -230,6 +333,7 @@ class Recorder:
         self.thread.join(timeout=self.interval + 10)
         self.sweeper.join(timeout=15)
         self.perf.close()
+        self.sensors.close()
 
     def _run_sweeper(self):
         """Ermittelt die Top-Prozesse getrennt von der Messung, damit diese nie darauf warten muss.
@@ -260,7 +364,8 @@ class Recorder:
         with open(self.csv_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=FIELDS)
             fh.write(f"# cpu_name={self.cpu_name or ''};nominal_mhz={self.nominal_mhz or ''};"
-                     f"interval={self.interval};cores={psutil.cpu_count() or ''}\n")
+                     f"interval={self.interval};cores={psutil.cpu_count() or ''};"
+                     f"gpu_name={(self.sensors.gpu_name or '').replace(';', ',')}\n")
             writer.writeheader()
             while not self.stop_event.wait(max(0.0, next_tick - time.monotonic())):
                 next_tick += self.interval
@@ -296,6 +401,7 @@ class Recorder:
             min(100.0, max(0.0, 100.0 - pc["disk_idle"])) if pc["disk_idle"] is not None else None, "")
         disk_lat, disk_lat_name = max(lat_each) if lat_each else (
             pc["disk_lat"] * 1000 if pc["disk_lat"] is not None else None, "")
+        sens = self.sensors.read()
         try:
             battery = psutil.sensors_battery()
         except Exception:
@@ -324,6 +430,10 @@ class Recorder:
             "disk_lat_name": disk_lat_name,
             "self_cpu": _r(self_cpu, 2),
             "sweep_s": "",
+            "gpu": _r(gpu_load(pc["gpu_engine"])),
+            "gpu_mem_mb": _r(gpu_memory_mb(pc["gpu_mem_dedicated"], pc["gpu_mem_shared"]), 0),
+            "cpu_temp": _r(sens["cpu_temp"]),
+            "gpu_temp": _r(sens["gpu_temp"]),
         }
         return row
 
@@ -380,6 +490,10 @@ def record(csv_path: Path, interval: float) -> bool:
           else "   (ohne Windows-Leistungsindikatoren)"))
     if rec.perf.missing:
         print(f"  Nicht verfügbar auf diesem Gerät: {', '.join(rec.perf.missing)}")
+    if rec.sensors.gpu_name:
+        print(f"  Grafik    : {rec.sensors.gpu_name}")
+    if rec.sensors.reason:
+        print(f"  [Hinweis] Temperatursensoren: {rec.sensors.reason}")
     print()
     print("  [ENTER]       Marker setzen, wenn es gerade gehakt hat (Text davor ist optional)")
     print("  q + [ENTER]   beenden und Bericht erzeugen (oder Strg+C)")
@@ -612,6 +726,34 @@ def diagnose(rows, meta) -> list:
              "Hält das Problem an: Wärmeleitpaste und Kühlung prüfen lassen."],
             when=limited)
 
+    hot = lambda r: r["cpu_temp"] >= 95
+    hot_share, _ = share(rows, hot)
+    if hot_share is not None and hot_share >= 5:
+        add("warn", "Der Prozessor wird sehr heiß",
+            f"In {fmt(hot_share, ' %')} der Zeit lag er bei 95 °C oder mehr "
+            f"(höchster Wert: {fmt(quantile(col(rows, 'cpu_temp'), 1.0), ' °C')}).",
+            "Ab etwa 95 bis 100 °C nimmt ein Prozessor Leistung zurück, um sich zu schützen. Kurze Spitzen "
+            "unter Volllast sind bei Laptops üblich; hält die Temperatur an, kostet das Geschwindigkeit.",
+            ["Im Diagramm „CPU-Takt“ prüfen, ob der Takt in diesen Phasen einbricht.",
+             "Lüftungsschlitze freihalten, den Laptop auf eine harte Unterlage stellen, Lüfter entstauben.",
+             "Hält das Problem an: Wärmeleitpaste und Kühlung prüfen lassen."],
+            when=hot)
+
+    # --- Grafikeinheit ------------------------------------------------------------
+    gpu_full = lambda r: r["gpu"] >= 90
+    gpu_share, _ = share(rows, gpu_full)
+    if gpu_share is not None and gpu_share >= 5:
+        add("warn", "Die Grafikeinheit ist voll ausgelastet",
+            f"In {fmt(gpu_share, ' %')} der Zeit war sie zu 90 % oder mehr beschäftigt.",
+            "Die Grafikeinheit zeichnet alles, was auf dem Bildschirm erscheint, und dekodiert Videos. Ist sie "
+            "voll, ruckeln Fenster, Videos und Animationen, auch wenn der Prozessor noch Luft hat. Eine "
+            "Onboard-Grafik ist dafür anfälliger als eine eigene Grafikkarte.",
+            ["Im Task-Manager unter Prozesse die Spalte „GPU“ einblenden: Sie zeigt, welches Programm sie belegt.",
+             "Häufige Auslöser: Videokonferenzen mit Hintergrundeffekten, viele Browser-Tabs mit Videos, "
+             "hochauflösende externe Bildschirme.",
+             "Grafiktreiber aktualisieren."],
+            when=gpu_full)
+
     # --- CPU schlicht ausgelastet -------------------------------------------------
     saturated = lambda r: r["cpu"] >= 90
     sat, _ = share(rows, saturated)
@@ -734,9 +876,12 @@ def diagnose(rows, meta) -> list:
 
     if not out:
         add("ok", "Keine Engstelle gefunden",
-            "Prozessor, Arbeitsspeicher und Laufwerke haben in dieser Messung nicht gebremst.",
-            "Wenn es trotzdem hakt, kommen Grafikkarte, Netzwerk oder das Programm selbst in Frage. "
-            "Diese drei misst das Skript nicht.",
+            "Die gemessenen Größen haben in dieser Messung nicht gebremst.",
+            ("Prozessor, Arbeitsspeicher, Laufwerke und Grafikeinheit waren unauffällig. Wenn es trotzdem "
+             "hakt, kommen Netzwerk oder das Programm selbst in Frage. Diese misst das Skript nicht."
+             if any(r["gpu"] is not None for r in rows) else
+             "Wenn es trotzdem hakt, kommen Grafikkarte, Netzwerk oder das Programm selbst in Frage. "
+             "Diese drei wurden in dieser Messung nicht erfasst."),
             ["Beim nächsten Hänger im Aufzeichnungsfenster ENTER drücken. Der Bericht zeigt dann, "
              "was genau in diesem Moment los war."])
     return out
@@ -797,6 +942,7 @@ def analyze_markers(rows) -> list:
         cpu, core, perf = peak("cpu"), peak("core_max"), low("perf_pct")
         ram, busy, lat, faults = peak("ram"), peak("disk_busy"), peak("disk_lat_ms"), peak("pages_out")
         limit = low("passive_limit")
+        gpu, cpu_temp = peak("gpu"), peak("cpu_temp")
         if cpu is not None and cpu >= 90:
             flags.append(f"CPU-Gesamtlast bis {fmt(cpu, ' %')}")
         elif core is not None and core >= 95:
@@ -805,6 +951,10 @@ def analyze_markers(rows) -> list:
             flags.append(f"CPU-Takt auf {fmt(perf, ' %')} des Nenntakts gefallen")
         if limit is not None and limit < 100:
             flags.append(f"thermisches Limit {fmt(limit, ' %')}")
+        if cpu_temp is not None and cpu_temp >= 95:
+            flags.append(f"CPU-Temperatur bis {fmt(cpu_temp, ' °C')}")
+        if gpu is not None and gpu >= 90:
+            flags.append(f"Grafikeinheit bis {fmt(gpu, ' %')} ausgelastet")
         if ram is not None and ram > 90:
             flags.append(f"RAM bei {fmt(ram, ' %')}")
         if faults is not None and faults >= 100:
@@ -879,6 +1029,15 @@ CHARTS = [
      "note": "Gelesen: auch normales Laden von Programmen und Dateien. Geschrieben: Windows lagert aus - "
              "dauerhaft über 0 heißt, der RAM reicht nicht.",
      "series": [["hard_faults", "gelesen", "a"], ["pages_out", "in Auslagerungsdatei geschrieben", "b"]]},
+    {"title": "Grafikeinheit", "unit": "%", "max": 100,
+     "note": "Auslastung der am stärksten beschäftigten GPU-Engine (wie im Task-Manager).",
+     "series": [["gpu", "Auslastung", "a"]]},
+    {"title": "Grafikspeicher", "unit": "MB",
+     "note": "Eigener und mit dem Arbeitsspeicher geteilter Speicher. Eine Onboard-Grafik nutzt fast nur geteilten.",
+     "series": [["gpu_mem_mb", "belegt", "a"]]},
+    {"title": "Temperatur", "unit": "°C", "ref": 95,
+     "note": "Gelesen über LibreHardwareMonitor. Ab der gestrichelten Linie (95 °C) drosseln Prozessoren meist.",
+     "series": [["cpu_temp", "Prozessor (wärmster Sensor)", "a"], ["gpu_temp", "Grafik", "b"]]},
     {"title": "Temperatur (ACPI-Thermalzone)", "unit": "°C",
      "note": "Grober Wert des Mainboards, nicht die Kerntemperatur der CPU.",
      "series": [["temp_c", "wärmste Zone", "b"]]},
@@ -1073,8 +1232,14 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
         (fmt(quantile(col(rows, "ram"), 1.0), " %"), "RAM (Maximum)"),
         (fmt(quantile(col(rows, "disk_lat_ms"), 0.95), " ms", 1), "Datenträger-Antwortzeit (P95)"),
     ]
+    gpu_p95 = quantile(col(rows, "gpu"), 0.95)
+    if gpu_p95 is not None:
+        tiles.append((fmt(gpu_p95, " %"), "Grafikeinheit (P95)"))
+    cpu_temp_max = quantile(col(rows, "cpu_temp"), 1.0)
     temp_max = quantile(col(rows, "temp_c"), 1.0)
-    if temp_max is not None:
+    if cpu_temp_max is not None:
+        tiles.append((fmt(cpu_temp_max, " °C"), "CPU-Temperatur (Maximum)"))
+    elif temp_max is not None:
         tiles.append((fmt(temp_max, " °C"), "Thermalzone (Maximum)"))
     tiles_html = "".join(f'<div class="tile"><b>{esc(v)}</b><span>{esc(l)}</span></div>' for v, l in tiles)
 
@@ -1088,7 +1253,7 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
         body = ""
         for i, m in enumerate(markers, 1):
             what = "; ".join(m["flags"]) if m["flags"] else \
-                "keine Auffälligkeit in den gemessenen Größen (evtl. Grafik, Netzwerk oder die Anwendung selbst)"
+                "keine Auffälligkeit in den gemessenen Größen (evtl. Netzwerk oder die Anwendung selbst)"
             procs = ", ".join(m["procs"]) or "-"
             body += (f"<tr><td class='n'>{i}</td><td>{m['ts']:%H:%M:%S}</td><td>{esc(m['label'])}</td>"
                      f"<td>{esc(what)}</td><td>{esc(procs)}</td></tr>")
@@ -1116,7 +1281,7 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
 
     # --- Diagrammdaten ---
     keys_max = ["cpu", "core_max", "ram", "commit", "disk_busy", "disk_lat_ms", "hard_faults", "pages_out",
-                "temp_c"]
+                "temp_c", "gpu", "gpu_mem_mb", "cpu_temp", "gpu_temp"]
     keys_min = ["perf_pct"]
     times, series = downsample(rows, keys_max, keys_min)
     charts = []
@@ -1157,8 +1322,16 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
     if missing:
         labels = {s[0]: f"{c['title']} ({s[1]})" for c in CHARTS for s in c["series"]}
         notes.append("Auf diesem Gerät nicht messbar: " + "; ".join(labels[k] for k in missing) + ".")
-    notes.append("Nicht erfasst werden Grafikkarte, Netzwerk und die echte CPU-Kerntemperatur - dafür wäre ein "
-                 "Sensor-Tool wie HWiNFO64 nötig.")
+    if meta.get("gpu_name"):
+        notes.append(f"Grafikeinheit: {esc(meta['gpu_name'])}.")
+    has = lambda key: any(r[key] is not None for r in rows)
+    if has("cpu_temp") and not has("gpu_temp"):
+        notes.append("Die Grafikeinheit meldet keine eigene Temperatur. Eine Onboard-Grafik sitzt im Prozessor, "
+                     "maßgeblich ist dann die CPU-Temperatur.")
+    if not has("cpu_temp"):
+        notes.append("Die CPU-Temperatur fehlt: Dafür muss das Skript als Administrator laufen (start.bat fragt "
+                     "danach) und der PawnIO-Treiber installiert sein (winget install PawnIO).")
+    notes.append("Nicht erfasst wird das Netzwerk.")
     batt, _ = share(rows, lambda r: r["on_battery"] == 1)
     if batt is not None:
         notes.append(f"Akkubetrieb: {fmt(batt, ' %')} der Zeit.")
