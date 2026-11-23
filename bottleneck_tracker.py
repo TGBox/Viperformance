@@ -3,22 +3,22 @@
 Bottleneck-Tracker: zeichnet auf, was den Laptop ausbremst, und erzeugt einen HTML-Bericht.
 
 Kommt ohne HWiNFO64, ohne Admin-Rechte und ohne Internet aus.
-Einzige Abhaengigkeit:  psutil (einmalig: uv sync  oder  pip install psutil)
+Einzige Abhängigkeit:  psutil (einmalig: uv sync  oder  pip install psutil)
 
 Start:       uv run bottleneck_tracker.py  (oder Doppelklick auf start.bat)
-Waehrend der Aufzeichnung:
+Während der Aufzeichnung:
     [ENTER]            Marker setzen ("jetzt hat es gehakt") - optional vorher Text tippen
-    q + [ENTER]        Aufzeichnung beenden und Bericht oeffnen   (Strg+C geht auch)
+    q + [ENTER]        Aufzeichnung beenden und Bericht öffnen   (Strg+C geht auch)
 
 Weitere Optionen:
     --interval 1.0     Messintervall in Sekunden
-    --out ORDNER       Zielordner fuer CSV und Bericht (Standard: ./logs neben dem Skript)
+    --out ORDNER       Zielordner für CSV und Bericht (Standard: ./logs neben dem Skript)
     --analyze DATEI    vorhandene CSV erneut auswerten, ohne neu zu messen
-    --no-open          Bericht nicht automatisch im Browser oeffnen
+    --no-open          Bericht nicht automatisch im Browser öffnen
 
 Datenquellen: psutil (CPU-Last je Kern, RAM, Prozesse, Akku) und die Windows-
-Leistungsindikatoren (PDH) fuer CPU-Takt, Datentraeger-Latenz, Auslagerung und
-ACPI-Thermalzonen. Die Indikatoren werden ueber ihre englischen Namen angesprochen
+Leistungsindikatoren (PDH) für CPU-Takt, Datenträger-Latenz, Auslagerung und
+ACPI-Thermalzonen. Die Indikatoren werden über ihre englischen Namen angesprochen
 und funktionieren deshalb auch auf einem deutschen Windows.
 """
 from __future__ import annotations
@@ -42,7 +42,8 @@ except ImportError:
     sys.exit("psutil fehlt. Bitte einmalig einrichten:  uv sync  (oder: pip install psutil)")
 
 IS_WINDOWS = sys.platform == "win32"
-PROCESS_SWEEP_SECONDS = 5.0   # so oft werden die Top-Prozesse ermittelt
+PROCESS_SWEEP_SECONDS = 10.0  # so oft werden die Top-Prozesse mindestens ermittelt
+SWEEP_DUTY = 0.2              # die Prozess-Abfrage darf höchstens diesen Anteil der Zeit laufen
 MARKER_BEFORE_S = 15          # Fenster vor einem Marker, das ausgewertet wird
 MARKER_AFTER_S = 3
 
@@ -50,6 +51,7 @@ FIELDS = [
     "ts", "cpu", "core_max", "perf_pct", "mhz", "ram", "commit", "hard_faults",
     "disk_busy", "disk_lat_ms", "disk_queue", "temp_c", "passive_limit",
     "on_battery", "marker", "top", "pages_out", "pagefile_pct", "disk_name", "disk_lat_name",
+    "self_cpu", "sweep_s",
 ]
 
 
@@ -74,7 +76,7 @@ class _PdhItem(ctypes.Structure):
 
 
 class PerfCounters:
-    """Kleine Huelle um PDH. Jeder Zaehler, der nicht existiert, liefert einfach None."""
+    """Kleine Hülle um PDH. Jeder Zähler, der nicht existiert, liefert einfach None."""
 
     FMT = 0x00000200 | 0x00008000   # PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
     MORE_DATA = 0x800007D2
@@ -127,9 +129,9 @@ class PerfCounters:
                         target[key] = handle
                     else:
                         self.missing.append(key)
-            pdh.PdhCollectQueryData(query)   # erste Probe: Raten-Zaehler brauchen zwei Messungen
+            pdh.PdhCollectQueryData(query)   # erste Probe: Raten-Zähler brauchen zwei Messungen
         except Exception as exc:             # PDH ist Zusatz - niemals die Messung daran scheitern lassen
-            print(f"[Hinweis] Windows-Leistungsindikatoren nicht verfuegbar: {exc}")
+            print(f"[Hinweis] Windows-Leistungsindikatoren nicht verfügbar: {exc}")
             self.query = None
 
     @property
@@ -137,7 +139,7 @@ class PerfCounters:
         return self.query is not None
 
     def read(self) -> dict:
-        """Liefert {name: float|None} fuer Einzelzaehler und {name: [(instanz, float)]} fuer Mehrfachzaehler."""
+        """Liefert {name: float|None} für Einzelzähler und {name: [(instanz, float)]} für Mehrfachzähler."""
         out = {k: None for k in self.SINGLE}
         out.update({k: [] for k in self.MULTI})
         if not self.available:
@@ -214,37 +216,62 @@ class Recorder:
         self._io_prev = {}
         self.samples = 0
         self.thread = threading.Thread(target=self._run, name="sampler", daemon=True)
+        self.sweeper = threading.Thread(target=self._run_sweeper, name="sweeper", daemon=True)
+        self._sweep_lock = threading.Lock()
+        self._sweep_result = None
+        self._self_prev = None
 
     def start(self):
-        self._sweep_processes()              # dito fuer die Prozess-Zaehler
         self.thread.start()
+        self.sweeper.start()
 
     def stop(self):
         self.stop_event.set()
         self.thread.join(timeout=self.interval + 10)
+        self.sweeper.join(timeout=15)
         self.perf.close()
+
+    def _run_sweeper(self):
+        """Ermittelt die Top-Prozesse getrennt von der Messung, damit diese nie darauf warten muss.
+
+        Auf manchen Rechnern dauert ein Durchlauf mehrere Sekunden (viele Prozesse, Virenscanner).
+        Deshalb passt sich der Abstand an: Die Abfrage läuft höchstens SWEEP_DUTY der Zeit.
+        """
+        self._sweep_processes()              # Zähler anstoßen, erster Durchlauf liefert noch keine Werte
+        pause = PROCESS_SWEEP_SECONDS
+        while not self.stop_event.wait(pause):
+            started = time.monotonic()
+            try:
+                result = self._sweep_processes()
+            except Exception:
+                continue
+            took = time.monotonic() - started
+            with self._sweep_lock:
+                self._sweep_result = (result, took)
+            pause = max(PROCESS_SWEEP_SECONDS - took, took * (1 - SWEEP_DUTY) / SWEEP_DUTY)
 
     def set_marker(self, label: str):
         with self._marker_lock:
             self._marker = label or "Marker"
 
     def _run(self):
-        psutil.cpu_percent(percpu=True)      # Zaehler anstossen (psutil merkt sich den Stand je Thread)
+        psutil.cpu_percent(percpu=True)      # Zähler anstoßen (psutil merkt sich den Stand je Thread)
         next_tick = time.monotonic() + self.interval
-        next_sweep = time.monotonic() + PROCESS_SWEEP_SECONDS
         with open(self.csv_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=FIELDS)
             fh.write(f"# cpu_name={self.cpu_name or ''};nominal_mhz={self.nominal_mhz or ''};"
-                     f"interval={self.interval}\n")
+                     f"interval={self.interval};cores={psutil.cpu_count() or ''}\n")
             writer.writeheader()
             while not self.stop_event.wait(max(0.0, next_tick - time.monotonic())):
                 next_tick += self.interval
                 if next_tick < time.monotonic():           # nach Standby nicht "nachholen"
                     next_tick = time.monotonic() + self.interval
                 row = self._sample()
-                if time.monotonic() >= next_sweep:
-                    next_sweep = time.monotonic() + PROCESS_SWEEP_SECONDS
-                    row["top"] = json.dumps(self._sweep_processes(), ensure_ascii=False)
+                with self._sweep_lock:
+                    sweep, self._sweep_result = self._sweep_result, None
+                if sweep:
+                    row["top"] = json.dumps(sweep[0], ensure_ascii=False)
+                    row["sweep_s"] = round(sweep[1], 2)
                 with self._marker_lock:
                     if self._marker:
                         row["marker"], self._marker = self._marker, None
@@ -254,10 +281,15 @@ class Recorder:
 
     def _sample(self) -> dict:
         cores = psutil.cpu_percent(percpu=True)
+        used, now = sum(os.times()[:2]), time.monotonic()      # CPU-Zeit dieses Skripts (alle Threads)
+        self_cpu = None
+        if self._self_prev and now > self._self_prev[1]:
+            self_cpu = 100.0 * (used - self._self_prev[0]) / (now - self._self_prev[1]) / (psutil.cpu_count() or 1)
+        self._self_prev = (used, now)
         pc = self.perf.read()
         perf_pct = pc["perf_pct"]
         temps = [k - 273.15 for _, k in pc["temp_k"] if k and k > 200]
-        # Je Laufwerk messen: "_Total" mittelt ueber alle Laufwerke und versteckt ein einzelnes volles.
+        # Je Laufwerk messen: "_Total" mittelt über alle Laufwerke und versteckt ein einzelnes volles.
         busy_each = [(min(100.0, max(0.0, 100.0 - v)), n) for n, v in pc["disk_idle_each"] if n != "_Total"]
         lat_each = [(v * 1000, n) for n, v in pc["disk_lat_each"] if n != "_Total"]
         disk_busy, disk_name = max(busy_each) if busy_each else (
@@ -290,6 +322,8 @@ class Recorder:
             "pagefile_pct": _r(pc["pagefile_pct"]),
             "disk_name": disk_name,
             "disk_lat_name": disk_lat_name,
+            "self_cpu": _r(self_cpu, 2),
+            "sweep_s": "",
         }
         return row
 
@@ -340,12 +374,12 @@ def record(csv_path: Path, interval: float) -> bool:
     rec = Recorder(csv_path, interval)
     rec.start()
     print("=" * 64)
-    print("AUFZEICHNUNG LAEUFT - arbeite ganz normal weiter.")
+    print("AUFZEICHNUNG LÄUFT - arbeite ganz normal weiter.")
     print(f"  Log-Datei : {csv_path}")
     print(f"  Intervall : {interval:g} s" + ("" if rec.perf.available or not IS_WINDOWS
           else "   (ohne Windows-Leistungsindikatoren)"))
     if rec.perf.missing:
-        print(f"  Nicht verfuegbar auf diesem Geraet: {', '.join(rec.perf.missing)}")
+        print(f"  Nicht verfügbar auf diesem Gerät: {', '.join(rec.perf.missing)}")
     print()
     print("  [ENTER]       Marker setzen, wenn es gerade gehakt hat (Text davor ist optional)")
     print("  q + [ENTER]   beenden und Bericht erzeugen (oder Strg+C)")
@@ -393,7 +427,7 @@ def load_csv(csv_path: Path) -> tuple:
             try:
                 ts = datetime.fromisoformat(raw["ts"])
             except (KeyError, ValueError, TypeError):
-                continue                       # abgeschnittene letzte Zeile o. ae.
+                continue                       # abgeschnittene letzte Zeile o. ä.
             row = {k: _num(raw.get(k)) for k in FIELDS if k not in ("ts", "marker", "top", "disk_name", "disk_lat_name")}
             row["disk_name"] = raw.get("disk_name") or ""
             row["disk_lat_name"] = raw.get("disk_lat_name") or ""
@@ -418,7 +452,7 @@ def quantile(values, q):
 
 
 def share(rows, predicate, base=None):
-    """Anteil (0..100) der Zeilen, fuer die predicate gilt; None-Werte zaehlen nicht mit."""
+    """Anteil (0..100) der Zeilen, für die predicate gilt; None-Werte zählen nicht mit."""
     hits = total = 0
     for row in rows:
         if base is not None and not _safe(base, row):
@@ -450,7 +484,7 @@ def col(rows, key):
 
 
 def top_label(sweeps):
-    """Auffaelligster Prozess (CPU bzw. I/O) aus einer Liste von Prozess-Durchlaeufen."""
+    """Auffälligster Prozess (CPU bzw. I/O) aus einer Liste von Prozess-Durchläufen."""
     best_cpu, best_io = None, None
     for sweep in sweeps:
         for name, cpu, io, *_ in sweep:
@@ -461,107 +495,292 @@ def top_label(sweeps):
     return best_cpu, best_io
 
 
+def episodes(rows, predicate, gap=5.0) -> list:
+    """Fasst aufeinanderfolgende Treffer zu Zeitabschnitten [(von, bis)] zusammen."""
+    out, start, prev = [], None, None
+    for row in rows:
+        if not _safe(predicate, row):
+            continue
+        ts = row["ts"]
+        if start is None:
+            start = prev = ts
+        elif (ts - prev).total_seconds() > gap:
+            out.append((start, prev))
+            start = prev = ts
+        else:
+            prev = ts
+    if start is not None:
+        out.append((start, prev))
+    return out
+
+
+def procs_during(rows, predicate, by="cpu") -> list:
+    """Aktivste Programme in den Phasen, in denen predicate zutraf: [(name, cpu_%, io_mb)].
+
+    Ein Prozess-Durchlauf beschreibt die Zeit seit dem vorherigen Durchlauf. Er zählt mit,
+    wenn in diesem Abschnitt mindestens ein Treffer lag.
+    """
+    agg, sweeps, hit = {}, 0, False
+    for row in rows:
+        hit = hit or _safe(predicate, row)
+        if row["top"] is None:
+            continue
+        if hit:
+            sweeps += 1
+            for name, cpu, io, *_ in row["top"]:
+                entry = agg.setdefault(name, [0.0, 0])
+                entry[0] += cpu
+                entry[1] += io
+        hit = False
+    table = [(name, v[0] / sweeps, v[1] / 1e6) for name, v in agg.items()]
+    table.sort(key=lambda e: e[2] if by == "io" else e[1], reverse=True)
+    return [e for e in table[:3] if (e[2] >= 1 if by == "io" else e[1] >= 0.5)]
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    return f"{seconds // 60} min {seconds % 60} s" if seconds % 60 else f"{seconds // 60} min"
+
+
 def diagnose(rows, meta) -> list:
-    """Liefert [(stufe, titel, text)], stufe in {'bad','warn','ok','info'}."""
+    """Liefert eine Liste von Befunden (dicts) für den Bericht.
+
+    level: 'bad' | 'warn' | 'ok'      title/summary: immer sichtbar
+    meaning/actions/extra: erscheinen beim Aufklappen
+    when: Bedingung je Messpunkt - daraus werden Zeiträume und beteiligte Programme ermittelt
+    """
     out = []
+
+    def add(level, title, summary, meaning, actions, when=None, by="cpu", extra=None):
+        out.append({"level": level, "title": title, "summary": summary, "meaning": meaning,
+                    "actions": actions, "when": when, "by": by, "extra": extra})
+
+    cores = _num(meta.get("cores"))
     loaded = lambda r: r["cpu"] >= 50
 
     # --- CPU-Drosselung: Takt bricht ein, obwohl Last anliegt ---------------------
+    throttled = lambda r: r["cpu"] >= 50 and r["perf_pct"] < 75
     thr, n_loaded = share(rows, lambda r: r["perf_pct"] < 75, base=loaded)
     if thr is not None and n_loaded >= 10 and thr >= 10:
-        on_batt, _ = share(rows, lambda r: r["on_battery"] == 1,
-                           base=lambda r: r["cpu"] >= 50 and r["perf_pct"] < 75)
-        hint = "Typische Ursachen: Hitze, Power-Limit des Netzteils/Akkus oder ein sparsamer Energiesparplan."
-        if on_batt is not None and on_batt >= 60:
-            hint = f"{fmt(on_batt, ' %')} dieser Phasen liefen im Akkubetrieb - mit Netzteil gegenpruefen."
-        out.append(("bad", "CPU wird unter Last gedrosselt",
-                    f"In {fmt(thr, ' %')} der Zeit mit CPU-Last ab 50 % lief der Prozessor mit weniger als "
-                    f"75 % seines Nenntakts. {hint}"))
+        on_batt, _ = share(rows, lambda r: r["on_battery"] == 1, base=throttled)
+        battery = (f" {fmt(on_batt, ' %')} dieser Phasen liefen im Akkubetrieb."
+                   if on_batt is not None and on_batt >= 60 else "")
+        add("bad", "Der Prozessor wird unter Last ausgebremst",
+            f"In {fmt(thr, ' %')} der Zeit mit hoher Last lief er mit weniger als drei Vierteln "
+            "seiner normalen Geschwindigkeit.",
+            "Wenn viel zu tun ist, schaltet ein Prozessor normalerweise hoch (Turbo). Hier ist er trotz Arbeit "
+            "langsamer geworden. Das passiert, wenn der Rechner zu heiß wird, zu wenig Strom bekommt oder auf "
+            "Stromsparen eingestellt ist." + battery,
+            ["Netzteil anschließen und den Test wiederholen.",
+             "In Windows unter Einstellungen > System > Netzbetrieb den Energiemodus auf „Beste Leistung“ stellen.",
+             "Lüftungsschlitze freihalten, den Laptop auf eine harte Unterlage stellen, Lüfter entstauben.",
+             "Im Diagramm „CPU-Takt“ nachsehen: Fällt die Linie erst nach einiger Zeit ab, ist es Hitze; "
+             "ist sie von Anfang an niedrig, ist es die Stromversorgung oder der Energiemodus."],
+            when=throttled)
+    else:
+        # Mittlere Last: Der Rechner arbeitet erkennbar, der Prozessor schaltet aber nicht hoch.
+        working = lambda r: r["cpu"] >= 30 or r["core_max"] >= 90
+        slowed = lambda r: (r["cpu"] >= 30 or r["core_max"] >= 90) and r["perf_pct"] < 75
+        slow, n_working = share(rows, lambda r: r["perf_pct"] < 75, base=working)
+        if slow is not None and n_working >= 20 and slow >= 25:
+            on_batt, _ = share(rows, lambda r: r["on_battery"] == 1, base=slowed)
+            battery = (f" {fmt(on_batt, ' %')} dieser Phasen liefen im Akkubetrieb - das ist die "
+                       "wahrscheinlichste Ursache." if on_batt is not None and on_batt >= 60 else "")
+            add("warn", "Der Prozessor läuft mit angezogener Bremse",
+                f"In {fmt(slow, ' %')} der Zeit, in der der Rechner zu tun hatte, lief er mit weniger als "
+                "drei Vierteln seiner normalen Geschwindigkeit.",
+                "Der Rechner hatte Arbeit, hat den Prozessor aber nicht hochgeschaltet. Im Akkubetrieb und in "
+                "Stromspar-Einstellungen ist das Absicht: Es spart Strom, macht aber alles langsamer." + battery,
+                ["Mit angeschlossenem Netzteil noch einmal messen und vergleichen.",
+                 "In Windows unter Einstellungen > System > Netzbetrieb den Energiemodus auf "
+                 "„Beste Leistung“ stellen.",
+                 "Bleibt der Takt auch am Netzteil niedrig: Leistungsprofil im Hersteller-Tool des Laptops prüfen."],
+                when=slowed)
 
-    passive, _ = share(rows, lambda r: r["passive_limit"] < 100)
+    limited = lambda r: r["passive_limit"] < 100
+    passive, _ = share(rows, limited)
     if passive is not None and passive >= 1:
-        out.append(("bad", "Thermische Drosselung durch Windows",
-                    f"In {fmt(passive, ' %', 1)} der Zeit hat die ACPI-Thermalzone die CPU-Leistung begrenzt "
-                    f"(niedrigstes Limit: {fmt(quantile(col(rows, 'passive_limit'), 0), ' %')}). "
-                    "Luefter/Kuehlkoerper reinigen, Unterlage und Leistungsmodus pruefen."))
+        add("bad", "Windows bremst den Prozessor wegen Hitze",
+            f"In {fmt(passive, ' %', 1)} der Zeit war die Leistung begrenzt "
+            f"(stärkste Begrenzung: auf {fmt(quantile(col(rows, 'passive_limit'), 0), ' %')}).",
+            "Der Rechner meldet selbst, dass er zu warm ist, und nimmt deshalb Leistung zurück, "
+            "um sich zu schützen.",
+            ["Lüftungsschlitze freihalten und Lüfter entstauben.",
+             "Den Laptop nicht auf Decke, Sofa oder Schoß betreiben.",
+             "Hält das Problem an: Wärmeleitpaste und Kühlung prüfen lassen."],
+            when=limited)
 
     # --- CPU schlicht ausgelastet -------------------------------------------------
-    sat, _ = share(rows, lambda r: r["cpu"] >= 90)
+    saturated = lambda r: r["cpu"] >= 90
+    sat, _ = share(rows, saturated)
     if sat is not None and sat >= 5:
-        out.append(("warn", "CPU voll ausgelastet",
-                    f"In {fmt(sat, ' %')} der Zeit lag die Gesamtlast bei 90 % oder mehr - "
-                    "siehe Tabelle der Top-Prozesse."))
+        add("warn", "Der Prozessor ist voll ausgelastet",
+            f"In {fmt(sat, ' %')} der Zeit waren alle Kerne zu 90 % oder mehr beschäftigt.",
+            "Alle Rechenkerne haben gleichzeitig gearbeitet. Jedes weitere Programm muss dann warten - "
+            "der ganze Rechner fühlt sich zäh an.",
+            ["Die Liste darüber zeigt, welche Programme in diesen Phasen am meisten gerechnet haben.",
+             "Ist es ein Programm, das du gerade bewusst benutzt (Export, Build, Videokonferenz), ist das normal.",
+             "Läuft es im Hintergrund, ohne dass du es brauchst: schließen oder seinen Autostart abschalten."],
+            when=saturated)
 
-    single, _ = share(rows, lambda r: r["core_max"] >= 95 and r["cpu"] < 50)
+    one_core = lambda r: r["core_max"] >= 95 and r["cpu"] < 50
+    single, _ = share(rows, one_core)
     if single is not None and single >= 5:
-        out.append(("warn", "Ein einzelner Kern am Anschlag",
-                    f"In {fmt(single, ' %')} der Zeit war ein Kern zu 95 % oder mehr belegt, waehrend die "
-                    "Gesamtlast unter 50 % blieb. Ein Programm rechnet auf nur einem Kern - mehr Kerne helfen "
-                    "hier nicht, nur hoeherer Takt."))
+        per_core = (f" Bei deinen {fmt(cores)} Kernen taucht so ein Programm in der Liste mit nur etwa "
+                    f"{fmt(100 / cores)} % Gesamtanteil auf." if cores else "")
+        always, _ = share(rows, lambda r: r["core_max"] >= 95)
+        own = [v for v in col(rows, "self_cpu") if v is not None]
+        self_cores = sum(own) / len(own) if own else None
+        if always is not None and always >= 98:
+            per_core += (" Der Kern war praktisch die ganze Messung über voll. Das spricht für ein Programm, das "
+                         "dauerhaft rechnet oder hängt - im Task-Manager unter Leistung > CPU > „Logische "
+                         "Prozessoren“ lässt sich das gegenprüfen.")
+        if self_cores is not None and cores and self_cores * cores >= 30:
+            per_core += (f" Achtung: Das Messskript selbst hat etwa {fmt(self_cores * cores)} % eines Kerns "
+                         "gebraucht und kann einen Teil dieses Befunds verursacht haben.")
+        add("warn", "Ein Programm lastet einen einzelnen Kern voll aus",
+            f"In {fmt(single, ' %')} der Zeit war ein Kern komplett belegt, obwohl insgesamt noch viel "
+            "Leistung frei war.",
+            "Viele Programme können nur einen Kern nutzen. Ist dieser eine Kern voll, reagiert genau dieses "
+            "Programm träge - egal, wie viele andere Kerne frei sind. Der Rest des Rechners bleibt dabei "
+            "meist flüssig." + per_core,
+            ["Die Liste darüber zeigt, welche Programme in diesen Phasen am meisten gerechnet haben.",
+             "Tut das Programm das dauerhaft, obwohl du nichts damit machst, hat es sich vermutlich "
+             "aufgehängt: beenden und neu starten.",
+             "Arbeitest du gerade damit, ist das normal. Schneller wird es dann nur mit einem Prozessor, "
+             "der pro Kern schneller ist - mehr Kerne helfen nicht."],
+            when=one_core)
 
     # --- RAM ----------------------------------------------------------------------
-    # "Pages Input/sec" zaehlt auch ganz normales Einlesen von Programm- und Datendateien.
+    # "Pages Input/sec" zählt auch ganz normales Einlesen von Programm- und Datendateien.
     # Echtes Auslagern zeigt sich an "Pages Output/sec" (Schreiben in die Auslagerungsdatei).
     ram_p90 = quantile(col(rows, "ram"), 0.90)
     faults_p95 = quantile(col(rows, "hard_faults"), 0.95)
-    out_p95 = quantile(col(rows, "pages_out"), 0.95)
-    paging, _ = share(rows, lambda r: r["pages_out"] >= 100)
+    swapping = lambda r: r["pages_out"] >= 100
+    paging, _ = share(rows, swapping)
+    hogs = sorted((p for p in top_processes(rows) if p["ram_mb"]), key=lambda p: p["ram_mb"], reverse=True)[:5]
+    hog_text = ("Größte Speicherverbraucher: " + ", ".join(
+        f"{p['name']} ({fmt(p['ram_mb'] / 1000, ' GB', 1)})" for p in hogs) + ".") if hogs else None
+    ram_actions = ["Die größten Verbraucher stehen unten. Nicht benötigte Programme und Browser-Tabs schließen.",
+                   "Kommt das im Alltag regelmäßig vor, hilft auf Dauer nur mehr Arbeitsspeicher."]
     if ram_p90 is not None and ram_p90 > 88:
-        procs = top_processes(rows)
-        hogs = sorted((p for p in procs if p["ram_mb"]), key=lambda p: p["ram_mb"], reverse=True)[:3]
-        who = (" Groesste Verbraucher: " + ", ".join(f"{p['name']} ({fmt(p['ram_mb'] / 1000, ' GB', 1)})"
-                                                      for p in hogs) + ".") if hogs else ""
         if paging is not None and paging >= 5:
-            level, extra = "bad", (f" In {fmt(paging, ' %')} der Zeit hat Windows Speicher in die "
-                                   f"Auslagerungsdatei geschrieben (P95: {fmt(out_p95)} Seiten/s) - es lagert "
-                                   "also tatsaechlich aus, und das bremst.")
+            add("bad", "Der Arbeitsspeicher reicht nicht aus",
+                f"Er war zu {fmt(ram_p90, ' %')} gefüllt, und in {fmt(paging, ' %')} der Zeit musste Windows "
+                "Daten auf das Laufwerk auslagern.",
+                "Ist der Arbeitsspeicher voll, schiebt Windows Daten auf das viel langsamere Laufwerk und holt "
+                "sie später zurück. Das spürt man als Hänger beim Wechseln zwischen Programmen.",
+                ram_actions, when=swapping, extra=hog_text)
         elif paging is not None:
-            level, extra = "warn", (" Windows hat dabei aber kaum in die Auslagerungsdatei geschrieben - "
-                                    "der Speicher ist knapp, hat in dieser Messung aber noch nicht gebremst.")
-        elif faults_p95 is not None and faults_p95 > 500:
-            level, extra = "warn", (f" Gleichzeitig wurden bis zu {fmt(faults_p95)} Seiten/s von der Platte "
-                                    "nachgeladen (P95). Das kann Auslagern sein, aber auch normales Einlesen von "
-                                    "Dateien - diese aeltere Messung unterscheidet das nicht.")
+            add("warn", "Der Arbeitsspeicher ist fast voll",
+                f"Er war zu {fmt(ram_p90, ' %')} gefüllt. Gebremst hat das in dieser Messung aber noch nicht.",
+                "Windows musste kaum Daten auf das Laufwerk auslagern - es war also knapp, aber noch nicht zu "
+                "wenig. Kommt ein weiteres großes Programm dazu, kann das kippen.",
+                ram_actions, extra=hog_text)
         else:
-            level, extra = "warn", ""
-        out.append((level, "Arbeitsspeicher knapp",
-                    f"In den Spitzen (P90) waren {fmt(ram_p90, ' %')} des RAM belegt.{extra}{who}"))
+            more = (f" Dabei wurden bis zu {fmt(faults_p95)} Speicherseiten pro Sekunde vom Laufwerk geladen."
+                    if faults_p95 is not None and faults_p95 > 500 else "")
+            add("warn", "Der Arbeitsspeicher ist fast voll",
+                f"Er war zu {fmt(ram_p90, ' %')} gefüllt.{more}",
+                "Diese ältere Messung kann nicht unterscheiden, ob Windows wirklich ausgelagert hat. "
+                "Eine neue Messung zeigt das.",
+                ram_actions, extra=hog_text)
     elif paging is not None and paging >= 5:
-        out.append(("warn", "Windows lagert aus",
-                    f"In {fmt(paging, ' %')} der Zeit wurde in die Auslagerungsdatei geschrieben, obwohl der RAM "
-                    "nicht dauerhaft voll war."))
+        add("warn", "Windows lagert Daten auf das Laufwerk aus",
+            f"In {fmt(paging, ' %')} der Zeit, obwohl der Arbeitsspeicher nicht dauerhaft voll war.",
+            "Windows hat Daten aus dem Arbeitsspeicher auf das Laufwerk geschoben. Das bremst kurz, "
+            "ist bei einzelnen Schüben aber unkritisch.",
+            ram_actions, when=swapping, extra=hog_text)
 
-    # --- Datentraeger (jeweils das am staerksten betroffene Laufwerk) ----------------
+    # --- Datenträger (jeweils das am stärksten betroffene Laufwerk) ----------------
     def worst_drive(key, predicate):
         names = [r.get(key) for r in rows if r.get(key) and _safe(predicate, r)]
-        if not names:
-            return ""
-        return f" Betroffen vor allem: Laufwerk {max(set(names), key=names.count)}."
+        return f" Betroffen ist vor allem Laufwerk {max(set(names), key=names.count)}." if names else ""
 
-    busy, _ = share(rows, lambda r: r["disk_busy"] >= 90)
+    disk_actions = ["Die Liste darüber zeigt, welche Programme in diesen Momenten am meisten gelesen und geschrieben haben.",
+                    "Häufige Auslöser sind Virenscanner, Windows-Update, die Suchindexierung und Cloud-Abgleich.",
+                    "Freien Speicherplatz prüfen - ein fast volles Laufwerk kann langsamer werden.",
+                    "Tritt es oft auf, den Zustand des Laufwerks auslesen (z. B. mit CrystalDiskInfo)."]
+    busy_pred = lambda r: r["disk_busy"] >= 90
+    slow_pred = lambda r: r["disk_lat_ms"] > 25
+    stall_pred = lambda r: r["disk_lat_ms"] >= 100
+    busy, _ = share(rows, busy_pred)
     lat_p95 = quantile(col(rows, "disk_lat_ms"), 0.95)
     lat_max = quantile(col(rows, "disk_lat_ms"), 1.0)
-    stalls, _ = share(rows, lambda r: r["disk_lat_ms"] >= 100)
+    stalls, _ = share(rows, stall_pred)
     if busy is not None and busy >= 5:
-        out.append(("warn", "Ein Laufwerk dauerhaft beschaeftigt",
-                    f"In {fmt(busy, ' %')} der Zeit war ein Laufwerk zu 90 % oder mehr aktiv."
-                    + worst_drive("disk_name", lambda r: r["disk_busy"] >= 90)))
+        add("warn", "Ein Laufwerk ist dauernd beschäftigt",
+            f"In {fmt(busy, ' %')} der Zeit hat es ohne Pause gearbeitet." + worst_drive("disk_name", busy_pred),
+            "Ein Laufwerk kann immer nur eine begrenzte Menge gleichzeitig lesen und schreiben. Ist es voll "
+            "beschäftigt, warten alle Programme, die etwas davon brauchen.",
+            disk_actions, when=busy_pred, by="io")
     if lat_p95 is not None and lat_p95 > 25:
-        out.append(("bad" if lat_p95 > 100 else "warn", "Datentraeger antwortet langsam",
-                    f"Die Antwortzeit lag in den Spitzen (P95) bei {fmt(lat_p95, ' ms', 1)}. "
-                    "Eine gesunde SSD bleibt meist unter 5 ms."
-                    + worst_drive("disk_lat_name", lambda r: r["disk_lat_ms"] > 25)))
+        add("bad" if lat_p95 > 100 else "warn", "Ein Laufwerk antwortet langsam",
+            f"Zugriffe dauerten oft bis zu {fmt(lat_p95, ' ms')}. Üblich sind bei einer SSD weniger als 5 ms."
+            + worst_drive("disk_lat_name", slow_pred),
+            "Jedes Öffnen, Speichern und Starten wartet auf das Laufwerk. Sind die Antwortzeiten dauerhaft "
+            "hoch, wirkt der ganze Rechner träge.",
+            disk_actions, when=slow_pred, by="io")
     elif stalls is not None and stalls >= 1:
-        out.append(("warn", "Datentraeger haengt zeitweise",
-                    f"In {fmt(stalls, ' %', 1)} der Zeit brauchte ein Zugriff 100 ms oder laenger "
-                    f"(Maximum {fmt(lat_max, ' ms')}). Solche Aussetzer spuert man als kurzes Einfrieren."
-                    + worst_drive("disk_lat_name", lambda r: r["disk_lat_ms"] >= 100)))
+        add("warn", "Ein Laufwerk hängt gelegentlich kurz",
+            f"In {fmt(stalls, ' %', 1)} der Zeit dauerte ein Zugriff eine Zehntelsekunde oder länger "
+            f"(längster: {fmt(lat_max, ' ms')})." + worst_drive("disk_lat_name", stall_pred),
+            "Die meiste Zeit antwortet das Laufwerk schnell, zwischendurch aber gar nicht. In so einem Moment "
+            "friert das Programm, das gerade darauf zugreift, kurz ein. Einzelne Aussetzer sind normal - "
+            "störend wird es erst, wenn sie sich häufen.",
+            disk_actions, when=stall_pred, by="io")
 
     if not out:
-        out.append(("ok", "Keine Hardware-Engstelle gefunden",
-                    "CPU-Takt, RAM und Datentraeger blieben im unauffaelligen Bereich. Wenn es trotzdem hakt, "
-                    "kommen Grafikkarte, Netzwerk oder die Anwendung selbst in Frage - diese misst das Skript nicht."))
+        add("ok", "Keine Engstelle gefunden",
+            "Prozessor, Arbeitsspeicher und Laufwerke haben in dieser Messung nicht gebremst.",
+            "Wenn es trotzdem hakt, kommen Grafikkarte, Netzwerk oder das Programm selbst in Frage. "
+            "Diese drei misst das Skript nicht.",
+            ["Beim nächsten Hänger im Aufzeichnungsfenster ENTER drücken. Der Bericht zeigt dann, "
+             "was genau in diesem Moment los war."])
     return out
+
+
+LEVEL_LABEL = {"bad": "Problem", "warn": "Auffällig", "ok": "In Ordnung"}
+
+
+def render_findings(rows, findings) -> str:
+    esc = html.escape
+    parts = []
+    for f in findings:
+        body = f"<h3>Was das bedeutet</h3><p>{esc(f['meaning'])}</p>"
+        if f["extra"]:
+            body += f"<p>{esc(f['extra'])}</p>"
+        if f["when"]:
+            spans = episodes(rows, f["when"])
+            if spans:
+                total = sum((b - a).total_seconds() + 1 for a, b in spans)
+                longest = sorted(sorted(spans, key=lambda s: s[1] - s[0], reverse=True)[:5])
+                items = "".join(
+                    f"<li>{a:%H:%M:%S}" + (f" bis {b:%H:%M:%S} ({fmt_duration((b - a).total_seconds() + 1)})"
+                                           if b > a else " (kurz)") + "</li>" for a, b in longest)
+                more = (f"<li>… und {len(spans) - 5} weitere{'r' if len(spans) == 6 else ''} kürzere{'r' if len(spans) == 6 else ''} Abschnitt{'e' if len(spans) != 6 else ''}</li>") if len(spans) > 5 else ""
+                body += (f"<h3>Wann es auftrat</h3><p>{len(spans)} Abschnitt{'e' if len(spans) != 1 else ''}, "
+                         f"zusammen {fmt_duration(total)}.{' Die längsten:' if len(spans) > 5 else ''}</p>"
+                         f"<ul>{items}{more}</ul>")
+            procs = procs_during(rows, f["when"], f["by"])
+            if procs:
+                if f["by"] == "io":
+                    items = "".join(f"<li>{esc(n)} - {fmt(io, ' MB')} gelesen und geschrieben</li>"
+                                    for n, _, io in procs)
+                else:
+                    items = "".join(f"<li>{esc(n)} - {fmt(cpu, ' %', 1)} der gesamten Rechenleistung</li>"
+                                    for n, cpu, _ in procs)
+                body += f"<h3>Aktivste Programme in diesen Phasen</h3><ul>{items}</ul>"
+        body += "<h3>Was du tun kannst</h3><ul>" + "".join(f"<li>{esc(a)}</li>" for a in f["actions"]) + "</ul>"
+        parts.append(
+            f'<details class="finding {f["level"]}"><summary>'
+            f'<span class="badge">{LEVEL_LABEL[f["level"]]}</span>'
+            f'<span class="f-title">{esc(f["title"])}</span>'
+            f'<span class="f-sum">{esc(f["summary"])}</span></summary>'
+            f'<div class="f-body">{body}</div></details>')
+    return "".join(parts)
 
 
 def analyze_markers(rows) -> list:
@@ -592,16 +811,19 @@ def analyze_markers(rows) -> list:
             flags.append(f"{fmt(faults)} Seiten/s in die Auslagerungsdatei geschrieben")
         if lat is not None and lat > 25:
             slow = max((r for r in window if r["disk_lat_ms"] is not None), key=lambda r: r["disk_lat_ms"])
-            flags.append(f"Datentraeger-Antwortzeit bis {fmt(lat, ' ms', 1)}"
+            flags.append(f"Datenträger-Antwortzeit bis {fmt(lat, ' ms', 1)}"
                          + (f" (Laufwerk {slow['disk_lat_name']})" if slow.get("disk_lat_name") else ""))
         elif busy is not None and busy >= 90:
-            flags.append(f"Datentraeger zu {fmt(busy, ' %')} aktiv")
-        best_cpu, best_io = top_label([r["top"] for r in window if r["top"]])
+            flags.append(f"Datenträger zu {fmt(busy, ' %')} aktiv")
+        sweeps = [r["top"] for r in window if r["top"]]
+        if not sweeps:                         # der nächste Durchlauf danach deckt den Marker-Zeitraum ab
+            sweeps = [r["top"] for r in rows[idx: idx + 120] if r["top"]][:1]
+        best_cpu, best_io = top_label(sweeps)
         procs = []
         if best_cpu and best_cpu[1] >= 5:
             procs.append(f"{best_cpu[0]} ({fmt(best_cpu[1], ' %')} CPU)")
         if best_io and best_io[1] >= 20_000_000 and (not best_cpu or best_io[0] != best_cpu[0]):
-            procs.append(f"{best_io[0]} ({fmt(best_io[1] / 1e6, ' MB')} Datentraeger-I/O)")
+            procs.append(f"{best_io[0]} ({fmt(best_io[1] / 1e6, ' MB')} Datenträger-I/O)")
         result.append({"ts": row["ts"], "label": row["marker"], "flags": flags, "procs": procs})
     return result
 
@@ -625,7 +847,7 @@ def top_processes(rows) -> list:
 
 
 def downsample(rows, keys_max, keys_min, limit=1200):
-    """Verdichtet lange Sitzungen, ohne Spitzen (bzw. Takt-Einbrueche) wegzumitteln."""
+    """Verdichtet lange Sitzungen, ohne Spitzen (bzw. Takt-Einbrüche) wegzumitteln."""
     step = max(1, -(-len(rows) // limit))
     times, series = [], {k: [] for k in keys_max + keys_min}
     for i in range(0, len(rows), step):
@@ -639,27 +861,27 @@ def downsample(rows, keys_max, keys_min, limit=1200):
 
 
 # =============================================================================
-# 4. HTML-Bericht (eine Datei, ohne Internet lauffaehig)
+# 4. HTML-Bericht (eine Datei, ohne Internet lauffähig)
 # =============================================================================
 CHARTS = [
     {"title": "CPU-Last", "unit": "%", "max": 100, "series": [
-        ["cpu", "Gesamt", "a"], ["core_max", "am staerksten belasteter Kern", "b"]]},
+        ["cpu", "Gesamt", "a"], ["core_max", "am stärksten belasteter Kern", "b"]]},
     {"title": "CPU-Takt relativ zum Nenntakt", "unit": "%", "ref": 100,
-     "note": "Ueber 100 % = Turbo. Faellt der Wert bei hoher Last deutlich unter 100 %, wird gedrosselt.",
+     "note": "Über 100 % = Turbo. Fällt der Wert bei hoher Last deutlich unter 100 %, wird gedrosselt.",
      "series": [["perf_pct", "Takt", "a"]]},
     {"title": "Arbeitsspeicher", "unit": "%", "max": 100, "series": [
         ["ram", "physisch belegt", "a"], ["commit", "zugesichert (inkl. Auslagerungsdatei)", "b"]]},
-    {"title": "Datentraeger-Aktivitaet", "unit": "%", "max": 100, "note": "Je Messpunkt das am staerksten beschaeftigte Laufwerk.",
+    {"title": "Datenträger-Aktivität", "unit": "%", "max": 100, "note": "Je Messpunkt das am stärksten beschäftigte Laufwerk.",
      "series": [["disk_busy", "aktive Zeit", "a"]]},
-    {"title": "Datentraeger-Antwortzeit", "unit": "ms", "note": "Je Messpunkt das langsamste Laufwerk.",
+    {"title": "Datenträger-Antwortzeit", "unit": "ms", "note": "Je Messpunkt das langsamste Laufwerk.",
      "series": [["disk_lat_ms", "Antwortzeit je Zugriff", "a"]]},
     {"title": "Speicherseiten von/zur Platte", "unit": "/s",
      "note": "Gelesen: auch normales Laden von Programmen und Dateien. Geschrieben: Windows lagert aus - "
-             "dauerhaft ueber 0 heisst, der RAM reicht nicht.",
+             "dauerhaft über 0 heißt, der RAM reicht nicht.",
      "series": [["hard_faults", "gelesen", "a"], ["pages_out", "in Auslagerungsdatei geschrieben", "b"]]},
     {"title": "Temperatur (ACPI-Thermalzone)", "unit": "°C",
      "note": "Grober Wert des Mainboards, nicht die Kerntemperatur der CPU.",
-     "series": [["temp_c", "waermste Zone", "b"]]},
+     "series": [["temp_c", "wärmste Zone", "b"]]},
 ]
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -687,12 +909,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tile { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
   .tile b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
   .tile span { color:var(--muted); font-size:12.5px; }
-  .finding { border-left:4px solid var(--info); padding:2px 0 2px 12px; margin:0 0 12px; }
+  .finding { border:1px solid var(--line); border-left:6px solid var(--info); border-radius:8px;
+             background:var(--bg); margin:0 0 12px; }
   .finding:last-child { margin-bottom:0; }
-  .finding b { display:block; }
-  .finding.bad { border-color:var(--bad); } .finding.bad b { color:var(--bad); }
-  .finding.warn { border-color:var(--warn); } .finding.warn b { color:var(--warn); }
-  .finding.ok { border-color:var(--ok); } .finding.ok b { color:var(--ok); }
+  .finding.bad { border-left-color:var(--bad); } .finding.bad .badge { color:var(--bad); }
+  .finding.warn { border-left-color:var(--warn); } .finding.warn .badge { color:var(--warn); }
+  .finding.ok { border-left-color:var(--ok); } .finding.ok .badge { color:var(--ok); }
+  .finding summary { cursor:pointer; list-style:none; padding:14px 16px; display:grid;
+                     grid-template-columns:auto 1fr auto; gap:6px 12px; align-items:center; border-radius:8px; }
+  .finding summary::-webkit-details-marker { display:none; }
+  .finding summary::after { content:"Details anzeigen \25BE"; color:var(--muted); font-size:13px; white-space:nowrap;
+                            grid-column:1 / -1; }
+  .finding[open] summary::after { content:"Details ausblenden \25B4"; }
+  .finding summary:hover::after { color:var(--ink); text-decoration:underline; }
+  .finding summary:focus-visible { outline:2px solid var(--info); outline-offset:2px; }
+  .badge { font-size:12px; font-weight:700; letter-spacing:.03em; text-transform:uppercase;
+           border:1.5px solid currentColor; border-radius:999px; padding:1px 9px; white-space:nowrap; }
+  .f-title { font-size:17px; font-weight:700; line-height:1.3; }
+  .f-sum { grid-column:1 / -1; font-size:15.5px; line-height:1.55; }
+  .f-body { padding:2px 16px 14px; border-top:1px solid var(--line); font-size:15px; line-height:1.6; }
+  .f-body h3 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:16px 0 4px; }
+  .f-body p { margin:0 0 6px; } .f-body ul { margin:0; padding-left:20px; } .f-body li { margin-bottom:3px; }
+  @media (max-width:600px) { .finding summary { grid-template-columns:1fr; } }
   table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
   th, td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--muted); font-weight:600; font-size:12.5px; }
@@ -713,10 +951,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <h1>Bottleneck-Bericht</h1>
   <p class="sub">__SUBTITLE__</p>
   <div class="tiles">__TILES__</div>
-  <div class="card"><h2>Diagnose</h2>__FINDINGS__</div>
+  <div class="card"><h2>Diagnose</h2>__FINDINGS__
+    <p class="note">Auf eine Meldung klicken, um Zeitpunkte, beteiligte Programme und Abhilfe zu sehen.</p></div>
   __MARKERS__
   <div class="card"><h2>Verlauf</h2>
-    <div class="cursor-time" id="cursorTime">Mit der Maus ueber ein Diagramm fahren, um Werte abzulesen.__MARKERHINT__</div>
+    <div class="cursor-time" id="cursorTime">Mit der Maus über ein Diagramm fahren, um Werte abzulesen.__MARKERHINT__</div>
   </div>
   <div id="charts"></div>
   __PROCESSES__
@@ -791,7 +1030,9 @@ D.charts.forEach(c => {
 });
 
 function showCursor(i) {
-  document.getElementById('cursorTime').textContent = i < 0 ? '' : 'Zeitpunkt: ' + timeFmt(D.t[i]);
+  const hint = document.getElementById('cursorTime');
+  hint.dataset.idle = hint.dataset.idle || hint.textContent;
+  hint.textContent = i < 0 ? hint.dataset.idle : 'Zeitpunkt: ' + timeFmt(D.t[i]);
   cursors.forEach(c => {
     c.line.setAttribute('visibility', i < 0 ? 'hidden' : 'visible');
     if (i >= 0) { c.line.setAttribute('x1', X(D.t[i])); c.line.setAttribute('x2', X(D.t[i])); }
@@ -809,7 +1050,7 @@ function showCursor(i) {
 def build_report(csv_path: Path, html_path: Path) -> bool:
     meta, rows = load_csv(csv_path)
     if len(rows) < 5:
-        print("Zu wenige Messpunkte fuer eine Auswertung - bitte laenger laufen lassen.")
+        print("Zu wenige Messpunkte für eine Auswertung - bitte länger laufen lassen.")
         return False
     esc = html.escape
     start, end = rows[0]["ts"], rows[-1]["ts"]
@@ -822,13 +1063,15 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
     if not perf_loaded:
         perf_loaded, takt_label = col(rows, "perf_pct"), "Takt (Median, keine Lastphase)"
     perf_med = quantile(perf_loaded, 0.5)
-    takt = fmt(perf_med, " %") + (f" ({fmt(nominal * perf_med / 100)} MHz)" if perf_med and nominal else "")
+    takt = fmt(perf_med, " %")
+    if perf_med and nominal:
+        takt_label += f" - {fmt(nominal * perf_med / 100)} MHz"
     tiles = [
         (fmt(quantile(col(rows, "cpu"), 0.95), " %"), "CPU-Last (P95)"),
-        (fmt(quantile(col(rows, "core_max"), 0.95), " %"), "staerkster Kern (P95)"),
+        (fmt(quantile(col(rows, "core_max"), 0.95), " %"), "stärkster Kern (P95)"),
         (takt if perf_med is not None else "n/v", takt_label),
         (fmt(quantile(col(rows, "ram"), 1.0), " %"), "RAM (Maximum)"),
-        (fmt(quantile(col(rows, "disk_lat_ms"), 0.95), " ms", 1), "Datentraeger-Antwortzeit (P95)"),
+        (fmt(quantile(col(rows, "disk_lat_ms"), 0.95), " ms", 1), "Datenträger-Antwortzeit (P95)"),
     ]
     temp_max = quantile(col(rows, "temp_c"), 1.0)
     if temp_max is not None:
@@ -836,8 +1079,7 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
     tiles_html = "".join(f'<div class="tile"><b>{esc(v)}</b><span>{esc(l)}</span></div>' for v, l in tiles)
 
     # --- Diagnose ---
-    findings_html = "".join(f'<div class="finding {lvl}"><b>{esc(title)}</b>{esc(text)}</div>'
-                            for lvl, title, text in diagnose(rows, meta))
+    findings_html = render_findings(rows, diagnose(rows, meta))
 
     # --- Marker ---
     markers = analyze_markers(rows)
@@ -846,16 +1088,19 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
         body = ""
         for i, m in enumerate(markers, 1):
             what = "; ".join(m["flags"]) if m["flags"] else \
-                "keine Auffaelligkeit in den gemessenen Groessen (evtl. Grafik, Netzwerk oder die Anwendung selbst)"
+                "keine Auffälligkeit in den gemessenen Größen (evtl. Grafik, Netzwerk oder die Anwendung selbst)"
             procs = ", ".join(m["procs"]) or "-"
             body += (f"<tr><td class='n'>{i}</td><td>{m['ts']:%H:%M:%S}</td><td>{esc(m['label'])}</td>"
                      f"<td>{esc(what)}</td><td>{esc(procs)}</td></tr>")
         markers_html = (f'<div class="card"><h2>Deine Marker - was in den {MARKER_BEFORE_S} Sekunden davor los war</h2>'
-                        "<table><tr><th class='n'>Nr.</th><th>Zeit</th><th>Notiz</th><th>Auffaellig</th>"
+                        "<table><tr><th class='n'>Nr.</th><th>Zeit</th><th>Notiz</th><th>Auffällig</th>"
                         f"<th>Aktivster Prozess</th></tr>{body}</table></div>")
 
     # --- Prozesse ---
     procs = top_processes(rows)
+    sweep_times = [r["ts"] for r in rows if r["top"] is not None]
+    gaps = [(b - a).total_seconds() for a, b in zip(sweep_times, sweep_times[1:])]
+    sweep_every = f"etwa alle {fmt(quantile(gaps, 0.5))} s" if gaps else "in Abständen"
     processes_html = ""
     if procs:
         body = "".join(
@@ -864,9 +1109,9 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
             f"<td class='n'>{fmt(p['ram_mb'] / 1000, ' GB', 1) if p['ram_mb'] else 'n/v'}</td></tr>" for p in procs)
         processes_html = ('<div class="card"><h2>Aktivste Prozesse</h2><table><tr><th>Prozess</th>'
                           "<th class='n'>CPU im Schnitt</th><th class='n'>CPU-Spitze</th>"
-                          "<th class='n'>Datentraeger-I/O gesamt</th><th class='n'>RAM (Spitze)</th></tr>"
+                          "<th class='n'>Datenträger-I/O gesamt</th><th class='n'>RAM (Spitze)</th></tr>"
                           f"{body}</table><p class='note'>CPU-Werte als Anteil an der gesamten Rechenleistung "
-                          f"(alle Kerne = 100 %), erfasst alle {PROCESS_SWEEP_SECONDS:g} s. Gleichnamige Prozesse "
+                          f"(alle Kerne = 100 %), erfasst {sweep_every}. Gleichnamige Prozesse "
                           "sind zusammengefasst.</p></div>")
 
     # --- Diagrammdaten ---
@@ -888,17 +1133,32 @@ def build_report(csv_path: Path, html_path: Path) -> bool:
     }
 
     notes = [f"Messintervall {esc(meta.get('interval', '?'))} s, {len(rows)} Messpunkte."]
+    interval = _num(meta.get("interval"))
+    expected = (end - start).total_seconds() / interval + 1 if interval else None
+    if expected and len(rows) < 0.85 * expected:
+        notes.insert(0, f"Achtung: Es fehlen {fmt(100 - 100 * len(rows) / expected, ' %')} der Messpunkte "
+                        f"({len(rows)} statt etwa {fmt(expected)}). Das Skript kam zeitweise nicht hinterher; "
+                        "Zeitanteile in der Diagnose sind deshalb ungenau.")
+    own = [v for v in col(rows, "self_cpu") if v is not None]
+    self_med = sum(own) / len(own) if own else None
+    if self_med is not None:
+        notes.append(f"Eigenverbrauch des Messskripts: {fmt(self_med, ' %', 1)} der gesamten Rechenleistung "
+                     "(Durchschnitt).")
+    sweep_med = quantile(col(rows, "sweep_s"), 0.5)
+    if sweep_med is not None and sweep_med >= 1:
+        notes.append(f"Die Prozess-Abfrage dauerte auf diesem Gerät etwa {fmt(sweep_med, ' s', 1)} je Durchlauf "
+                     "und läuft deshalb seltener.")
     if minutes < 2:
-        notes.insert(0, "Sehr kurze Messung - die Diagnose ist nur eine Momentaufnahme. Aussagekraeftig wird es "
+        notes.insert(0, "Sehr kurze Messung - die Diagnose ist nur eine Momentaufnahme. Aussagekräftig wird es "
                         "ab einigen Minuten normaler Arbeit, am besten mit Markern.")
     if len(rows) > len(times):
-        notes.append("Fuer die Diagramme wurden die Daten verdichtet; dabei bleibt je Abschnitt die Spitze "
+        notes.append("Für die Diagramme wurden die Daten verdichtet; dabei bleibt je Abschnitt die Spitze "
                      "(beim Takt der tiefste Wert) erhalten.")
     if missing:
         labels = {s[0]: f"{c['title']} ({s[1]})" for c in CHARTS for s in c["series"]}
-        notes.append("Auf diesem Geraet nicht messbar: " + "; ".join(labels[k] for k in missing) + ".")
-    notes.append("Nicht erfasst werden Grafikkarte, Netzwerk und die echte CPU-Kerntemperatur - dafuer waere ein "
-                 "Sensor-Tool wie HWiNFO64 noetig.")
+        notes.append("Auf diesem Gerät nicht messbar: " + "; ".join(labels[k] for k in missing) + ".")
+    notes.append("Nicht erfasst werden Grafikkarte, Netzwerk und die echte CPU-Kerntemperatur - dafür wäre ein "
+                 "Sensor-Tool wie HWiNFO64 nötig.")
     batt, _ = share(rows, lambda r: r["on_battery"] == 1)
     if batt is not None:
         notes.append(f"Akkubetrieb: {fmt(batt, ' %')} der Zeit.")
@@ -926,9 +1186,9 @@ def main():
     parser = argparse.ArgumentParser(description="Zeichnet Laptop-Engstellen auf und erzeugt einen HTML-Bericht.")
     parser.add_argument("--interval", type=float, default=1.0, help="Messintervall in Sekunden (Standard: 1.0)")
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "logs",
-                        help="Zielordner fuer CSV und Bericht")
+                        help="Zielordner für CSV und Bericht")
     parser.add_argument("--analyze", type=Path, metavar="CSV", help="vorhandene CSV auswerten statt neu zu messen")
-    parser.add_argument("--no-open", action="store_true", help="Bericht nicht im Browser oeffnen")
+    parser.add_argument("--no-open", action="store_true", help="Bericht nicht im Browser öffnen")
     args = parser.parse_args()
     if args.interval < 0.2:
         parser.error("--interval muss mindestens 0.2 Sekunden betragen")

@@ -35,13 +35,14 @@ Optionen: `--interval 0.5` (Messintervall in s), `--out ORDNER`,
 | Datenträger-Aktivität/-Latenz | `% Idle Time`, `Avg. Disk sec/Transfer` je Laufwerk |
 | Thermische Drosselung         | `Thermal Zone Information` (falls vorhanden)        |
 | Akku-/Netzbetrieb             | psutil                                              |
-| Top-Prozesse (CPU, I/O)       | psutil, alle 5 s                                    |
+| Top-Prozesse (CPU, I/O, RAM) | psutil, mind. alle 10 s (eigener Thread)           |
 
 Nicht erfasst: Grafikkarte, Netzwerk, echte CPU-Kerntemperatur.
 
 ## Diagnose-Regeln
 
 - **Drosselung:** CPU-Last ≥ 50 % und Takt < 75 % des Nenntakts in ≥ 10 % der Lastzeit
+- **Angezogene Bremse:** Last ≥ 30 % oder ein Kern ≥ 90 %, und Takt < 75 % in ≥ 25 % dieser Zeit
 - **Thermisches Limit:** ACPI-Passivlimit < 100 % in ≥ 1 % der Zeit
 - **CPU ausgelastet:** Gesamtlast ≥ 90 % in ≥ 5 % der Zeit
 - **Ein Kern am Anschlag:** ein Kern ≥ 95 % bei Gesamtlast < 50 % in ≥ 5 % der Zeit
